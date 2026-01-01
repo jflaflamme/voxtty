@@ -1,0 +1,15 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release
+
+override_dh_auto_install:
+	install -D -m755 target/release/voxtty debian/voxtty/usr/bin/voxtty
+	install -D -m644 packaging/assets/voxtty.service debian/voxtty/usr/lib/systemd/user/voxtty.service
+
+override_dh_auto_clean:
+	cargo clean || true
+	dh_auto_clean

@@ -1,0 +1,25 @@
+[Unit]
+Description=VoxTTY Voice Assistant
+Documentation=https://github.com/jflaflamme/voxtty
+After=sound.target dbus.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/voxtty --tray --assistant --realtime --elevenlabs --bidirectional --llm anthropic
+Restart=on-failure
+RestartSec=5
+Environment=YDOTOOL_SOCKET=/run/user/%U/.ydotool_socket
+EnvironmentFile=-%h/.config/voxtty/env
+
+# Resource limits
+Nice=0
+CPUQuota=50%
+MemoryMax=500M
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=voxtty
+
+[Install]
+WantedBy=default.target

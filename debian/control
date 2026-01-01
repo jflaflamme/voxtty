@@ -1,0 +1,20 @@
+Source: voxtty
+Section: utils
+Priority: optional
+Maintainer: Jean-Francois Laflamme <meetjeff@pm.me>
+Build-Depends: debhelper-compat (= 13), cargo, rustc, pkg-config, libasound2-dev, libdbus-1-dev
+Standards-Version: 4.6.0
+Homepage: https://github.com/jflaflamme/voxtty
+
+Package: voxtty
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends},
+         dbus,
+         alsa-utils
+Recommends: pulseaudio | pipewire-pulse, ydotool
+Description: Voice assistant that listens on Linux
+ voxtty is a voice-controlled assistant for Linux with wake-word mode switching.
+ Say "code mode" to switch, "hey assistant" for AI help, or "dictation mode"
+ for typing. Choose your backend: local Whisper for privacy or cloud AI for
+ advanced features. System tray control, realtime streaming, and system-wide
+ typing via ydotool.

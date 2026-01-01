@@ -1,0 +1,27 @@
+voxtty (0.1.0-2) unstable; urgency=medium
+
+  * Fix Command mode tool calling (process_command wrapper handling)
+  * Add systemd user service for auto-start on boot
+  * Enable systemctl --user control (start/stop/restart/status)
+  * Service reads from user config (~/.config/voxtty/config.toml)
+  * Add text output toggle to tray menu (like TUI 'o' key)
+  * Add Command mode to tray mode selection menu
+  * Service runs with realtime ElevenLabs mode and bidirectional by default
+  * Default backend set to ElevenLabs realtime
+
+ -- Jeff Laflamme <meetjeff@pm.me>  Sat, 28 Dec 2024 08:15:00 +0000
+
+voxtty (0.1.0-1) unstable; urgency=medium
+
+  * Initial release
+  * Voice-controlled assistant with wake-word mode switching
+  * AI assistant, code, and dictation modes
+  * Real-time speech-to-text conversion with VAD
+  * System tray icon with toggle control
+  * System-wide typing via ydotool
+  * Support for local Whisper and cloud AI backends
+  * Realtime WebSocket streaming (~150ms latency)
+  * Echo test mode for audio verification
+  * Interactive device and model selection
+
+ -- Jeff Laflamme <meetjeff@pm.me>  Wed, 15 Oct 2025 15:00:00 +0000

@@ -1,0 +1,27 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        # Reload systemd user daemon for all users
+        # This will be picked up when users log in
+        echo "VoxTTY installed successfully!"
+        echo ""
+        echo "To enable and start the service:"
+        echo "  systemctl --user enable voxtty.service"
+        echo "  systemctl --user start voxtty.service"
+        echo ""
+        echo "To control the service:"
+        echo "  systemctl --user status voxtty.service"
+        echo "  systemctl --user stop voxtty.service"
+        echo "  systemctl --user restart voxtty.service"
+        echo ""
+        echo "To enable auto-start on boot:"
+        echo "  systemctl --user enable voxtty.service"
+        echo "  loginctl enable-linger $USER"
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

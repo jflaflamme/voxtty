@@ -1,0 +1,17 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove|upgrade|deconfigure)
+        # Try to stop the service if it's running
+        # This will only work if run as the user who started it
+        if systemctl --user is-active --quiet voxtty.service 2>/dev/null; then
+            echo "Stopping voxtty service..."
+            systemctl --user stop voxtty.service 2>/dev/null || true
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

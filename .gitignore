@@ -1,0 +1,42 @@
+# Rust
+/target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.deb
+*.buildinfo
+*.changes
+
+# Debian build artifacts
+debian/.debhelper/
+debian/debhelper-build-stamp
+debian/files
+debian/*/
+debian/*.debhelper
+debian/*.substvars
+
+# Temporary files
+/tmp/
+*.wav
+
+# Config with secrets
+config.toml
+
+CLAUDE.md
+AGENTS.md
+.claude
+.opencode
+docs/
+
+# Local project research and debug files
+research/
+.ruff_cache/
