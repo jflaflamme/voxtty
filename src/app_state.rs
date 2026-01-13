@@ -110,13 +110,13 @@ pub fn sync_state(
 
 /// Helper to compare modes (ignores context/language fields)
 fn matches_mode(a: &VoiceMode, b: &VoiceMode) -> bool {
-    match (a, b) {
-        (VoiceMode::Dictation, VoiceMode::Dictation) => true,
-        (VoiceMode::Assistant { .. }, VoiceMode::Assistant { .. }) => true,
-        (VoiceMode::Code { .. }, VoiceMode::Code { .. }) => true,
-        (VoiceMode::Command, VoiceMode::Command) => true,
-        _ => false,
-    }
+    matches!(
+        (a, b),
+        (VoiceMode::Dictation, VoiceMode::Dictation)
+            | (VoiceMode::Assistant { .. }, VoiceMode::Assistant { .. })
+            | (VoiceMode::Code { .. }, VoiceMode::Code { .. })
+            | (VoiceMode::Command, VoiceMode::Command)
+    )
 }
 
 /// Helper to print mode change with privacy warning

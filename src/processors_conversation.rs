@@ -407,17 +407,25 @@ impl AudioProcessor for ConversationProcessor {
         let rt = tokio::runtime::Runtime::new()?;
 
         rt.block_on(async {
-            let mut ctx = self.context.lock().unwrap();
+            // Get current state (lock scope minimized)
+            let current_state = {
+                let ctx = self.context.lock().unwrap();
+                ctx.state.clone()
+            };
 
-            match ctx.state {
+            match current_state {
                 ConversationState::Idle | ConversationState::Processing => {
-                    // New conversation or continuation
-                    ctx.add_user_message(transcription.clone());
-                    ctx.state = ConversationState::Processing;
-                    drop(ctx); // Release lock before async call
+                    // New conversation or continuation - update state
+                    {
+                        let mut ctx = self.context.lock().unwrap();
+                        ctx.add_user_message(transcription.clone());
+                        ctx.state = ConversationState::Processing;
+                    }
 
-                    // Analyze if we need clarification
+                    // Get context snapshot for analysis (separate lock scope)
                     let ctx_snapshot = self.context.lock().unwrap().clone();
+
+                    // Analyze if we need clarification (no lock held during await)
                     eprintln!("[DEBUG ConversationProcessor] Calling analyze_transcription");
                     let analysis = self
                         .analyze_transcription(&transcription, &ctx_snapshot, mode)
@@ -427,16 +435,23 @@ impl AudioProcessor for ConversationProcessor {
                         analysis.needs_clarification
                     );
 
-                    let mut ctx = self.context.lock().unwrap();
+                    // Check if clarification is needed
+                    let (needs_clarification, can_clarify) = {
+                        let ctx = self.context.lock().unwrap();
+                        (analysis.needs_clarification, ctx.can_ask_clarification())
+                    };
 
-                    if analysis.needs_clarification && ctx.can_ask_clarification() {
+                    if needs_clarification && can_clarify {
                         if let Some(question) = analysis.clarification_question {
-                            ctx.add_assistant_message(question.clone());
-                            ctx.state = ConversationState::WaitingForClarification;
-                            ctx.clarification_count += 1;
-                            drop(ctx); // Release lock before async call
+                            // Update context state
+                            {
+                                let mut ctx = self.context.lock().unwrap();
+                                ctx.add_assistant_message(question.clone());
+                                ctx.state = ConversationState::WaitingForClarification;
+                                ctx.clarification_count += 1;
+                            }
 
-                            // Speak the question
+                            // Speak the question (no lock held)
                             self.handle_clarification(&question).await?;
 
                             // Return formatted output for display (not typing)
@@ -446,27 +461,28 @@ impl AudioProcessor for ConversationProcessor {
                         }
                     } else {
                         // No clarification needed or limit reached - execute
-                        ctx.state = ConversationState::ReadyToExecute;
+                        {
+                            let mut ctx = self.context.lock().unwrap();
+                            ctx.state = ConversationState::ReadyToExecute;
+                        }
 
                         if let Some(response) = analysis.response {
-                            ctx.add_assistant_message(response.clone());
+                            {
+                                let mut ctx = self.context.lock().unwrap();
+                                ctx.add_assistant_message(response.clone());
+                            }
 
                             // Check if this is a TTS response (starts with 🔊)
                             if response.starts_with("🔊 ") {
                                 let speak_text = response.trim_start_matches("🔊 ").trim();
-                                drop(ctx); // Release lock before async call
 
                                 // Speak via TTS in background
                                 if let Some(tts) = &self.tts_client {
                                     eprintln!("🔊 Speaking final answer via ElevenLabs...");
-                                    eprintln!("[DEBUG] About to clone TTS client");
                                     let tts_clone = Arc::clone(tts);
-                                    eprintln!("[DEBUG] About to clone speak text");
                                     let speak_text_owned = speak_text.to_string();
-                                    eprintln!("[DEBUG] About to clone is_tts_speaking");
                                     let is_speaking_clone = Arc::clone(&self.is_tts_speaking);
 
-                                    eprintln!("[DEBUG] About to set is_tts_speaking = true");
                                     // Spawn TTS in background thread
                                     *is_speaking_clone.lock().unwrap() = true;
                                     eprintln!("[DEBUG] Set is_tts_speaking = true");
@@ -498,24 +514,34 @@ impl AudioProcessor for ConversationProcessor {
                 }
 
                 ConversationState::WaitingForClarification => {
-                    // User is answering a clarification question
-                    ctx.add_user_message(transcription.clone());
-                    ctx.state = ConversationState::Processing;
-                    drop(ctx); // Release lock before async call
+                    // User is answering a clarification question - update state
+                    {
+                        let mut ctx = self.context.lock().unwrap();
+                        ctx.add_user_message(transcription.clone());
+                        ctx.state = ConversationState::Processing;
+                    }
 
-                    // Re-analyze with the new context
+                    // Get context snapshot for re-analysis
                     let ctx_snapshot = self.context.lock().unwrap().clone();
+
+                    // Re-analyze with the new context (no lock held during await)
                     let analysis = self
                         .analyze_transcription(&transcription, &ctx_snapshot, mode)
                         .await?;
 
-                    let mut ctx = self.context.lock().unwrap();
+                    // Check if more clarification is needed
+                    let (needs_clarification, can_clarify) = {
+                        let ctx = self.context.lock().unwrap();
+                        (analysis.needs_clarification, ctx.can_ask_clarification())
+                    };
 
-                    if analysis.needs_clarification && ctx.can_ask_clarification() {
+                    if needs_clarification && can_clarify {
                         if let Some(question) = analysis.clarification_question {
-                            ctx.add_assistant_message(question.clone());
-                            ctx.clarification_count += 1;
-                            drop(ctx); // Release lock before async call
+                            {
+                                let mut ctx = self.context.lock().unwrap();
+                                ctx.add_assistant_message(question.clone());
+                                ctx.clarification_count += 1;
+                            }
 
                             self.handle_clarification(&question).await?;
                             Ok(format!("🔊 {}", question))
@@ -523,27 +549,28 @@ impl AudioProcessor for ConversationProcessor {
                             Ok(String::new())
                         }
                     } else {
-                        ctx.state = ConversationState::Completed;
+                        {
+                            let mut ctx = self.context.lock().unwrap();
+                            ctx.state = ConversationState::Completed;
+                        }
 
                         if let Some(response) = analysis.response {
-                            ctx.add_assistant_message(response.clone());
+                            {
+                                let mut ctx = self.context.lock().unwrap();
+                                ctx.add_assistant_message(response.clone());
+                            }
 
                             // Check if this is a TTS response (starts with 🔊)
                             if response.starts_with("🔊 ") {
                                 let speak_text = response.trim_start_matches("🔊 ").trim();
-                                drop(ctx); // Release lock before async call
 
                                 // Speak via TTS in background
                                 if let Some(tts) = &self.tts_client {
                                     eprintln!("🔊 Speaking final answer via ElevenLabs...");
-                                    eprintln!("[DEBUG] About to clone TTS client");
                                     let tts_clone = Arc::clone(tts);
-                                    eprintln!("[DEBUG] About to clone speak text");
                                     let speak_text_owned = speak_text.to_string();
-                                    eprintln!("[DEBUG] About to clone is_tts_speaking");
                                     let is_speaking_clone = Arc::clone(&self.is_tts_speaking);
 
-                                    eprintln!("[DEBUG] About to set is_tts_speaking = true");
                                     // Spawn TTS in background thread
                                     *is_speaking_clone.lock().unwrap() = true;
                                     eprintln!("[DEBUG] Set is_tts_speaking = true");
@@ -576,6 +603,7 @@ impl AudioProcessor for ConversationProcessor {
 
                 ConversationState::ReadyToExecute | ConversationState::Completed => {
                     // Reset for new conversation
+                    let mut ctx = self.context.lock().unwrap();
                     ctx.reset();
                     Ok(String::new())
                 }
@@ -637,27 +665,37 @@ impl ConversationProcessor {
         let rt = tokio::runtime::Runtime::new()?;
 
         rt.block_on(async {
-            let mut ctx = self.context.lock().unwrap();
-            ctx.add_user_message(text.to_string());
-            ctx.state = ConversationState::Processing;
-            drop(ctx);
+            // Update context state (minimized lock scope)
+            {
+                let mut ctx = self.context.lock().unwrap();
+                ctx.add_user_message(text.to_string());
+                ctx.state = ConversationState::Processing;
+            }
 
-            // Analyze the text
+            // Get context snapshot for analysis (separate lock scope)
             let ctx_snapshot = self.context.lock().unwrap().clone();
+
+            // Analyze the text (no lock held during await)
             let analysis = self
                 .analyze_transcription(text, &ctx_snapshot, mode)
                 .await?;
 
-            let mut ctx = self.context.lock().unwrap();
+            // Check if clarification is needed
+            let (needs_clarification, can_clarify) = {
+                let ctx = self.context.lock().unwrap();
+                (analysis.needs_clarification, ctx.can_ask_clarification())
+            };
 
-            if analysis.needs_clarification && ctx.can_ask_clarification() {
+            if needs_clarification && can_clarify {
                 if let Some(question) = analysis.clarification_question {
-                    ctx.add_assistant_message(question.clone());
-                    ctx.state = ConversationState::WaitingForClarification;
-                    ctx.clarification_count += 1;
-                    drop(ctx);
+                    {
+                        let mut ctx = self.context.lock().unwrap();
+                        ctx.add_assistant_message(question.clone());
+                        ctx.state = ConversationState::WaitingForClarification;
+                        ctx.clarification_count += 1;
+                    }
 
-                    // Speak the question
+                    // Speak the question (no lock held)
                     self.handle_clarification(&question).await?;
 
                     // Return formatted output for display
@@ -666,15 +704,20 @@ impl ConversationProcessor {
                     Ok(String::new())
                 }
             } else {
-                ctx.state = ConversationState::ReadyToExecute;
+                {
+                    let mut ctx = self.context.lock().unwrap();
+                    ctx.state = ConversationState::ReadyToExecute;
+                }
 
                 if let Some(response) = analysis.response {
-                    ctx.add_assistant_message(response.clone());
+                    {
+                        let mut ctx = self.context.lock().unwrap();
+                        ctx.add_assistant_message(response.clone());
+                    }
 
                     // Check if this is a TTS response (starts with 🔊)
                     if response.starts_with("🔊 ") {
                         let speak_text = response.trim_start_matches("🔊 ").trim();
-                        drop(ctx); // Release lock before async call
 
                         // Speak via TTS in background
                         if let Some(tts) = &self.tts_client {
