@@ -2054,7 +2054,9 @@ fn main() -> Result<()> {
             println!("   • Say 'dictation mode' to return to normal");
             println!("   • LLM: {} ({})", llm_model, llm_base_url);
 
-            // Check if using non-local/non-offline model
+            // Privacy check: Detect local vs cloud LLM backends
+            // Local (privacy-preserving): localhost, 127.0.0.1, 0.0.0.0 (e.g., Ollama)
+            // Cloud (sends data): Any other URL (OpenAI, Anthropic, Google, etc.)
             let is_local = llm_base_url.contains("localhost")
                 || llm_base_url.contains("127.0.0.1")
                 || llm_base_url.contains("0.0.0.0");

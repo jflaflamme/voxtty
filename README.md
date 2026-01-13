@@ -99,9 +99,9 @@ voxtty was inspired by [themanyone/voice_typing](https://github.com/themanyone/v
 | **Best For** | Minimal setup | Production use | **Lowest latency** |
 
 **Realtime Providers:**
-- **Speaches** - Self-hosted, free, ~150ms latency
-- **ElevenLabs** - Cloud, excellent accuracy, requires API key
-- **OpenAI** - Cloud, GPT-4o transcription, requires API key
+- **Speaches** - Self-hosted, free, ~150ms latency, 🔒 **100% LOCAL** (privacy-preserving)
+- **ElevenLabs** - Cloud, excellent accuracy, requires API key, ☁️ **CLOUD** (sends audio to third-party)
+- **OpenAI** - Cloud, GPT-4o transcription, requires API key, ☁️ **CLOUD** (sends audio to third-party)
 
 ## ✨ Features
 
@@ -731,6 +731,32 @@ export TRANSCRIPTION_MODEL_ID=Systran/faster-distil-whisper-small.en
 | whisper.cpp | (default) | `http://127.0.0.1:7777/inference` | Config file or env var |
 | Speaches | `--speaches` | `http://localhost:8000/v1/audio/transcriptions` | Config file or env var |
 
+### Privacy Summary by Component
+
+Quick reference for privacy-conscious users:
+
+| Component | Backend | Privacy | Internet Required | CLI Flag |
+|-----------|---------|---------|-------------------|----------|
+| **Transcription** | whisper.cpp | 🔒 100% Local | No | (default) |
+| | Speaches | 🔒 100% Local | No | `--speaches` |
+| | Speaches Realtime | 🔒 100% Local | No | `--realtime --speaches` |
+| | OpenAI Realtime | ☁️ Cloud | Yes | `--realtime --openai` |
+| | ElevenLabs | ☁️ Cloud | Yes | `--realtime --elevenlabs` |
+| **LLM (Assistant/Code)** | Ollama | 🔒 100% Local | No | `--llm ollama` |
+| | Anthropic Claude | ☁️ Cloud | Yes | `--llm anthropic` |
+| | OpenAI GPT | ☁️ Cloud | Yes | `--llm openai` |
+| | Google Gemini | ☁️ Cloud | Yes | `--llm google` |
+| | DeepSeek | ☁️ Cloud | Yes | `--llm deepseek` |
+
+**Privacy Tip**: For complete privacy, use:
+```bash
+# 100% offline voice typing
+voxtty --speaches --tray
+
+# 100% offline with AI assistance
+voxtty --speaches --assistant --llm ollama --tray
+```
+
 ### ⚠️ Important: ydotool Setup
 
 **Ubuntu's ydotool package is BROKEN**. You MUST build from source:
@@ -762,6 +788,42 @@ If you experience issues with voice detection:
    - Increase VAD sensitivity
 
 ## 🏗️ Architecture
+
+### What voxtty IS (and what it's NOT)
+
+voxtty is a **voice-to-text application** that listens to your microphone and types text system-wide. It's designed for direct user interaction, not as a protocol server.
+
+**voxtty is NOT an MCP server**, and here's why:
+
+- **MCP (Model Context Protocol)** is Anthropic's protocol for connecting AI models to external tools and data sources
+- **voxtty** is a standalone desktop application for voice typing, not a tool server
+- **Different use case**: MCP servers provide context to AI models; voxtty provides voice input to users
+- **Different architecture**: voxtty uses a processor pattern with direct LLM API calls, not the MCP protocol
+
+**Why we considered MCP support (but didn't implement it)**:
+
+We explored adding MCP as an **Assistant backend** (like we have for OpenAI, Anthropic, Ollama) to allow the Assistant mode to call external tools. The architecture already supports it via the `AssistantBackend` trait:
+
+```rust
+// src/processors_assistant.rs
+pub trait AssistantBackend {
+    fn process_with_llm(&self, audio_path: &Path, mode: &VoiceMode) -> Result<String>;
+}
+
+// Implemented: SpeachesAssistantBackend (uses direct LLM APIs)
+// Not implemented: MCPAssistantBackend (would use MCP protocol)
+```
+
+**Why it's not implemented yet**:
+
+1. **Core functionality works without it** - Direct LLM API calls (OpenAI, Anthropic, Ollama) cover most use cases
+2. **Additional complexity** - MCP adds protocol overhead and server dependencies
+3. **Can be added later** - The architecture is ready; it's a backend swap, not a redesign
+4. **Community input needed** - Uncertain if users want MCP integration for this use case
+
+**If you need MCP functionality**: Consider using voxtty for voice input and a separate MCP-enabled tool for tool calling. The Unix philosophy of composing single-purpose tools often works better than one tool doing everything.
+
+That said, if there's demand, we can implement the `MCPAssistantBackend` - the plumbing is already there!
 
 ### Core Components
 

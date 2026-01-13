@@ -121,6 +121,9 @@ fn matches_mode(a: &VoiceMode, b: &VoiceMode) -> bool {
 
 /// Helper to print mode change with privacy warning
 pub fn print_mode_change(mode: &VoiceMode, base_url: &str) {
+    // Detect if backend URL is cloud-based by checking for localhost indicators
+    // Local: localhost, 127.0.0.1, 0.0.0.0
+    // Cloud: Any other URL (OpenAI, Anthropic, ElevenLabs, etc.)
     let is_cloud = !base_url.contains("localhost")
         && !base_url.contains("127.0.0.1")
         && !base_url.contains("0.0.0.0");
