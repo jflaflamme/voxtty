@@ -925,6 +925,6 @@ This project is licensed under the GNU General Public License v2.0 - see the [LI
 
 ---
 
-**Made with ❤️ by Jean-Francois Laflamme**
+**Made with ❤️ by Jeff Laflamme**
 
 *Privacy-focused voice typing for everyone*

@@ -36,6 +36,7 @@ mod controls;
 mod conversation;
 mod elevenlabs_tts;
 mod model_selector;
+mod models_cache;
 mod modes;
 mod processors;
 mod processors_assistant;
