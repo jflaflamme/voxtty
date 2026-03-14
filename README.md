@@ -601,6 +601,9 @@ voxtty --realtime --speaches --auto --tray
 | `--openai` | Use OpenAI for transcription |
 | `--assistant` | Enable assistant modes with wake word activation |
 | `--auto` | Enable voice commands without full assistant mode |
+| `--mcp` | **Enable MCP tool calling** (loads `~/.config/voxtty/mcp_servers.json`) |
+| `--mock-mcp` | Use built-in mock MCP server for testing (weather, dice, calc, etc.) |
+| `--bidirectional` | Enable bidirectional conversation with TTS responses |
 
 **Configuration Priority**: CLI flags → Environment variables → Defaults
 
@@ -793,37 +796,81 @@ If you experience issues with voice detection:
 
 voxtty is a **voice-to-text application** that listens to your microphone and types text system-wide. It's designed for direct user interaction, not as a protocol server.
 
-**voxtty is NOT an MCP server**, and here's why:
+voxtty supports **MCP (Model Context Protocol)** tool calling, allowing the LLM to invoke external tools during conversation — check the weather, roll dice, run calculations, control smart home devices, and more.
 
-- **MCP (Model Context Protocol)** is Anthropic's protocol for connecting AI models to external tools and data sources
-- **voxtty** is a standalone desktop application for voice typing, not a tool server
-- **Different use case**: MCP servers provide context to AI models; voxtty provides voice input to users
-- **Different architecture**: voxtty uses a processor pattern with direct LLM API calls, not the MCP protocol
+#### Quick Start
 
-**Why we considered MCP support (but didn't implement it)**:
+```bash
+# Test with built-in mock MCP server
+./target/release/voxtty --mock-mcp --assistant --bidirectional --realtime --elevenlabs
 
-We explored adding MCP as an **Assistant backend** (like we have for OpenAI, Anthropic, Ollama) to allow the Assistant mode to call external tools. The architecture already supports it via the `AssistantBackend` trait:
-
-```rust
-// src/processors_assistant.rs
-pub trait AssistantBackend {
-    fn process_with_llm(&self, audio_path: &Path, mode: &VoiceMode) -> Result<String>;
-}
-
-// Implemented: SpeachesAssistantBackend (uses direct LLM APIs)
-// Not implemented: MCPAssistantBackend (would use MCP protocol)
+# Use your own MCP servers
+./target/release/voxtty --mcp --assistant --bidirectional --realtime --elevenlabs
 ```
 
-**Why it's not implemented yet**:
+#### MCP Server Configuration
 
-1. **Core functionality works without it** - Direct LLM API calls (OpenAI, Anthropic, Ollama) cover most use cases
-2. **Additional complexity** - MCP adds protocol overhead and server dependencies
-3. **Can be added later** - The architecture is ready; it's a backend swap, not a redesign
-4. **Community input needed** - Uncertain if users want MCP integration for this use case
+voxtty supports two config formats:
 
-**If you need MCP functionality**: Consider using voxtty for voice input and a separate MCP-enabled tool for tool calling. The Unix philosophy of composing single-purpose tools often works better than one tool doing everything.
+**Option 1: Native TOML** (`~/.config/voxtty/mcp_servers.toml`):
 
-That said, if there's demand, we can implement the `MCPAssistantBackend` - the plumbing is already there!
+```toml
+[[servers]]
+name = "weather"
+command = "python3"
+args = ["-m", "weather_mcp_server"]
+
+[servers.env]
+API_KEY = "your-api-key"
+
+[[servers]]
+name = "home-assistant"
+command = "node"
+args = ["path/to/ha-mcp-server.js"]
+```
+
+**Option 2: Claude Code format** (`.mcp.json` in project directory — auto-detected as fallback):
+
+```json
+{
+  "mcpServers": {
+    "weather": {
+      "type": "stdio",
+      "command": "python3",
+      "args": ["-m", "weather_mcp_server"],
+      "env": { "API_KEY": "your-api-key" }
+    }
+  }
+}
+```
+
+Each server is spawned as a child process and communicates via JSON-RPC over stdio. On startup, voxtty discovers available tools via `tools/list` and makes them available to the LLM alongside built-in tools (speak, type_text, switch_mode, process_command).
+
+#### How It Works
+
+1. voxtty spawns each MCP server and sends `initialize` + `tools/list`
+2. Discovered tools are added to the LLM's tool definitions
+3. When the LLM calls an MCP tool, voxtty executes it via `tools/call` and feeds the result back
+4. The LLM uses the result to formulate a spoken or typed response
+5. Max 5 tool call iterations per turn (prevents infinite loops)
+
+#### Built-in Mock Server (`--mock-mcp`)
+
+For testing without external servers:
+- **get_time** — Current date/time
+- **calculate** — Math expressions (sqrt, trig, pi)
+- **weather** — Mock weather for common cities
+- **random_fact** — Random fun facts
+- **dice_roll** — Standard notation (2d6, 1d20+3)
+- **echo** — Echo test
+
+#### Writing Your Own MCP Server
+
+Any program that reads JSON-RPC from stdin and writes to stdout works. See `test_mcp_server.py` for a complete Python example. The protocol follows the [MCP specification](https://spec.modelcontextprotocol.io/).
+
+### Barge-in (TTS Interruption)
+
+When using bidirectional mode, speaking while the AI is talking interrupts playback immediately. The interrupt triggers on partial transcription (~200ms), enabling natural conversational flow without waiting for the AI to finish.
 
 ### Core Components
 
@@ -832,6 +879,7 @@ That said, if there's demand, we can implement the `MCPAssistantBackend` - the p
 - **Transcription** - Whisper.cpp or Speaches API
 - **Text Input** - ydotool for system-wide typing
 - **UI Controls** - ksni (system tray)
+- **MCP Tools** - External tool integration via stdio JSON-RPC
 
 ### Audio Pipeline
 

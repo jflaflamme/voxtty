@@ -1,8 +1,16 @@
 // Assistant processor with pluggable backends
+use crate::mcp_tools::McpManager;
 use crate::processors::{AudioProcessor, ProcessContext, VoiceMode};
 use anyhow::Result;
 use std::any::Any;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+/// Built-in tool names that are handled by main.rs, not by MCP
+const BUILTIN_TOOLS: &[&str] = &["process_command", "speak", "switch_mode"];
+
+/// Maximum number of MCP tool call iterations per conversation turn
+const MAX_TOOL_ITERATIONS: usize = 5;
 
 /// Assistant backend trait
 ///
@@ -77,15 +85,25 @@ pub struct SpeachesAssistantConfig {
     pub llm_model: String,
     pub system_prompt: String,
     pub code_system_prompt: String,
+    pub mcp_tools: Vec<serde_json::Value>,
 }
 
 pub struct SpeachesAssistantBackend {
     config: SpeachesAssistantConfig,
+    mcp_manager: Option<Arc<Mutex<McpManager>>>,
 }
 
 impl SpeachesAssistantBackend {
     pub fn new(config: SpeachesAssistantConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            mcp_manager: None,
+        }
+    }
+
+    pub fn with_mcp_manager(mut self, manager: Arc<Mutex<McpManager>>) -> Self {
+        self.mcp_manager = Some(manager);
+        self
     }
 
     fn get_system_prompt(&self, mode: &VoiceMode) -> String {
@@ -164,32 +182,37 @@ impl SpeachesAssistantBackend {
     }
 }
 
+#[derive(serde::Deserialize, Debug)]
+struct FunctionCall {
+    name: String,
+    arguments: String,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct ToolCall {
+    id: Option<String>,
+    function: FunctionCall,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct Message {
+    content: Option<String>,
+    tool_calls: Option<Vec<ToolCall>>,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct Choice {
+    message: Message,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct ChatResponse {
+    choices: Vec<Choice>,
+}
+
 impl SpeachesAssistantBackend {
-    /// Send text to LLM and get response
-    fn call_llm(&self, text: &str, mode: &VoiceMode, debug: bool) -> Result<String> {
-        let client = reqwest::blocking::Client::new();
-        let url = format!("{}/chat/completions", self.config.base_url);
-
-        let system_prompt = self.get_system_prompt(mode);
-
-        let mut body = serde_json::json!({
-            "model": self.config.llm_model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": system_prompt
-                },
-                {
-                    "role": "user",
-                    "content": text
-                }
-            ],
-            "temperature": 0.3
-        });
-
-        // Add tool definitions
-        // 1. "process_command" - always available in Command mode
-        // 2. "speak" - available in Assistant and Command mode
+    /// Build the tools array for the LLM request
+    fn build_tools(&self, mode: &VoiceMode) -> (serde_json::Value, bool) {
         let mut tools = serde_json::json!([]);
         let mut has_tools = false;
 
@@ -275,19 +298,25 @@ impl SpeachesAssistantBackend {
             tools.as_array_mut().unwrap().push(switch_mode_tool);
         }
 
-        if has_tools {
-            if let Some(obj) = body.as_object_mut() {
-                obj.insert("tools".to_string(), tools);
-                // In Command mode, force tool usage to prevent plain text responses
-                // In Assistant mode, allow LLM to decide (for dictation vs speak)
-                let tool_choice = if matches!(mode, VoiceMode::Command) {
-                    serde_json::json!("required")
-                } else {
-                    serde_json::json!("auto")
-                };
-                obj.insert("tool_choice".to_string(), tool_choice);
-            }
+        // Append MCP tools
+        for mcp_tool in &self.config.mcp_tools {
+            tools.as_array_mut().unwrap().push(mcp_tool.clone());
+            has_tools = true;
         }
+
+        (tools, has_tools)
+    }
+
+    /// Send a chat completion request and parse the response
+    fn send_chat_request(
+        &self,
+        body: &serde_json::Value,
+        debug: bool,
+    ) -> Result<ChatResponse> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?;
+        let url = format!("{}/chat/completions", self.config.base_url);
 
         if debug {
             println!("[DEBUG] Sending request to Chat Completion API");
@@ -296,8 +325,7 @@ impl SpeachesAssistantBackend {
             println!("[DEBUG] API Key set: {}", !self.config.api_key.is_empty());
         }
 
-        // Send request with Authorization header if API key is set
-        let mut request = client.post(&url).json(&body);
+        let mut request = client.post(&url).json(body);
 
         if !self.config.api_key.is_empty() {
             request = request.header("Authorization", format!("Bearer {}", self.config.api_key));
@@ -313,67 +341,173 @@ impl SpeachesAssistantBackend {
             anyhow::bail!("Chat Completion API error: {} - {}", status, error_text);
         }
 
-        #[derive(serde::Deserialize, Debug)]
-        struct FunctionCall {
-            name: String,
-            arguments: String,
-        }
-
-        #[derive(serde::Deserialize, Debug)]
-        struct ToolCall {
-            function: FunctionCall,
-        }
-
-        #[derive(serde::Deserialize, Debug)]
-        struct Message {
-            content: Option<String>,
-            tool_calls: Option<Vec<ToolCall>>,
-        }
-
-        #[derive(serde::Deserialize, Debug)]
-        struct Choice {
-            message: Message,
-        }
-
-        #[derive(serde::Deserialize, Debug)]
-        struct ChatResponse {
-            choices: Vec<Choice>,
-        }
-
         let result: ChatResponse = response.json()?;
 
         if result.choices.is_empty() {
             anyhow::bail!("No response from LLM");
         }
 
-        let message = &result.choices[0].message;
+        Ok(result)
+    }
 
-        // Check for tool calls first
-        if let Some(tool_calls) = &message.tool_calls {
-            if let Some(call) = tool_calls.first() {
-                if debug {
-                    println!(
-                        "[DEBUG] Received tool call: {} args: {}",
-                        call.function.name, call.function.arguments
-                    );
+    /// Send text to LLM and get response, with MCP tool call loop
+    fn call_llm(&self, text: &str, mode: &VoiceMode, debug: bool) -> Result<String> {
+        let mut system_prompt = self.get_system_prompt(mode);
+
+        // Inject current date/time so the LLM always knows
+        let now = chrono::Local::now();
+        system_prompt.push_str(&format!(
+            "\n\n## CURRENT CONTEXT\n\n- **Date**: {}\n- **Time**: {}\n",
+            now.format("%A, %B %d, %Y"),
+            now.format("%I:%M %p")
+        ));
+
+        // Append MCP tool descriptions so the LLM knows what external tools are available
+        if !self.config.mcp_tools.is_empty() {
+            system_prompt.push_str("\n\n## EXTERNAL TOOLS (MCP)\n\n");
+            system_prompt.push_str(
+                "You also have access to external tools provided by MCP servers. \
+                 Use these tools when the user's request matches their capabilities. \
+                 After calling an external tool, use `speak` to tell the user the result.\n\n",
+            );
+            for tool in &self.config.mcp_tools {
+                if let (Some(name), Some(desc)) = (
+                    tool.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|n| n.as_str()),
+                    tool.get("function")
+                        .and_then(|f| f.get("description"))
+                        .and_then(|d| d.as_str()),
+                ) {
+                    system_prompt.push_str(&format!("- **`{}`**: {}\n", name, desc));
                 }
-
-                // Wrap the tool call in our internal format so main.rs knows what to do
-                // Format: {"_voxtty_tool": "name", "args": {...}}
-                let args_value: serde_json::Value = serde_json::from_str(&call.function.arguments)
-                    .unwrap_or(serde_json::Value::Null);
-
-                let wrapper = serde_json::json!({
-                    "_voxtty_tool": call.function.name,
-                    "args": args_value
-                });
-
-                return Ok(wrapper.to_string());
             }
         }
 
-        // Fallback to content
-        Ok(message.content.clone().unwrap_or_default())
+        let mut messages = vec![
+            serde_json::json!({
+                "role": "system",
+                "content": system_prompt
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": text
+            }),
+        ];
+
+        let (tools, has_tools) = self.build_tools(mode);
+
+        for iteration in 0..=MAX_TOOL_ITERATIONS {
+            let mut body = serde_json::json!({
+                "model": self.config.llm_model,
+                "messages": messages,
+                "temperature": 0.3
+            });
+
+            if has_tools {
+                if let Some(obj) = body.as_object_mut() {
+                    obj.insert("tools".to_string(), tools.clone());
+                    let tool_choice = if matches!(mode, VoiceMode::Command) && iteration == 0 {
+                        serde_json::json!("required")
+                    } else {
+                        serde_json::json!("auto")
+                    };
+                    obj.insert("tool_choice".to_string(), tool_choice);
+                }
+            }
+
+            let result = self.send_chat_request(&body, debug)?;
+            let message = &result.choices[0].message;
+
+            // Check for tool calls
+            if let Some(tool_calls) = &message.tool_calls {
+                if let Some(call) = tool_calls.first() {
+                    let tool_name = &call.function.name;
+                    let tool_id = call.id.as_deref().unwrap_or("call_0");
+
+                    if debug {
+                        println!(
+                            "[DEBUG] Received tool call: {} args: {} (iteration {})",
+                            tool_name, call.function.arguments, iteration
+                        );
+                    }
+
+                    let args_value: serde_json::Value =
+                        serde_json::from_str(&call.function.arguments)
+                            .unwrap_or(serde_json::Value::Null);
+
+                    // If it's a built-in tool, return it for main.rs to handle
+                    if BUILTIN_TOOLS.contains(&tool_name.as_str()) {
+                        let wrapper = serde_json::json!({
+                            "_voxtty_tool": tool_name,
+                            "args": args_value
+                        });
+                        return Ok(wrapper.to_string());
+                    }
+
+                    // It's an MCP tool — execute it and loop back
+                    if let Some(ref mcp_mgr) = self.mcp_manager {
+                        if iteration >= MAX_TOOL_ITERATIONS {
+                            if debug {
+                                println!(
+                                    "[DEBUG] Max MCP tool iterations ({}) reached, returning last content",
+                                    MAX_TOOL_ITERATIONS
+                                );
+                            }
+                            return Ok(message.content.clone().unwrap_or_default());
+                        }
+
+                        let tool_result = match mcp_mgr.lock().unwrap().call_tool(tool_name, args_value.clone()) {
+                            Ok(result) => result,
+                            Err(e) => format!("Error calling tool '{}': {}", tool_name, e),
+                        };
+
+                        if debug {
+                            println!(
+                                "[DEBUG] MCP tool '{}' result: {}",
+                                tool_name,
+                                &tool_result[..tool_result.len().min(200)]
+                            );
+                        }
+
+                        // Add assistant message with tool call
+                        messages.push(serde_json::json!({
+                            "role": "assistant",
+                            "content": serde_json::Value::Null,
+                            "tool_calls": [{
+                                "id": tool_id,
+                                "type": "function",
+                                "function": {
+                                    "name": tool_name,
+                                    "arguments": call.function.arguments
+                                }
+                            }]
+                        }));
+
+                        // Add tool result message
+                        messages.push(serde_json::json!({
+                            "role": "tool",
+                            "tool_call_id": tool_id,
+                            "content": tool_result
+                        }));
+
+                        continue; // Loop back to LLM with tool result
+                    }
+
+                    // MCP manager not available — return tool call as-is
+                    let wrapper = serde_json::json!({
+                        "_voxtty_tool": tool_name,
+                        "args": args_value
+                    });
+                    return Ok(wrapper.to_string());
+                }
+            }
+
+            // No tool call — return content
+            return Ok(message.content.clone().unwrap_or_default());
+        }
+
+        anyhow::bail!("Exceeded maximum tool call iterations")
     }
 }
 
@@ -411,54 +545,5 @@ impl AssistantBackend for SpeachesAssistantBackend {
 
     fn name(&self) -> &str {
         "ChatCompletionAPI"
-    }
-}
-
-// ============================================================================
-// MCP Backend (Future Implementation)
-// ============================================================================
-
-#[derive(Debug, Clone)]
-pub struct MCPAssistantConfig {
-    #[allow(dead_code)]
-    pub server_url: String,
-    // Add MCP-specific config
-}
-
-pub struct MCPAssistantBackend {
-    #[allow(dead_code)]
-    config: MCPAssistantConfig,
-}
-
-impl MCPAssistantBackend {
-    #[allow(dead_code)]
-    pub fn new(config: MCPAssistantConfig) -> Self {
-        Self { config }
-    }
-}
-
-impl AssistantBackend for MCPAssistantBackend {
-    fn process_with_llm(
-        &self,
-        _audio_path: &Path,
-        _mode: &VoiceMode,
-        _debug: bool,
-    ) -> Result<String> {
-        // TODO: Implement MCP integration
-        anyhow::bail!("MCP backend not yet implemented")
-    }
-
-    fn process_text_with_llm(
-        &self,
-        _text: &str,
-        _mode: &VoiceMode,
-        _debug: bool,
-    ) -> Result<String> {
-        // TODO: Implement MCP integration
-        anyhow::bail!("MCP backend not yet implemented")
-    }
-
-    fn name(&self) -> &str {
-        "MCP"
     }
 }

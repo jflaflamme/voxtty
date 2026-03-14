@@ -1,6 +1,7 @@
 // Bidirectional conversation processor with clarification support
 use crate::conversation::{ConversationContext, ConversationState, LlmAnalysisResponse};
 use crate::elevenlabs_tts::ElevenLabsTts;
+use crate::mcp_tools::McpManager;
 use crate::processors::{AudioProcessor, ProcessContext, VoiceMode};
 use anyhow::{Context, Result};
 use reqwest::Client;
@@ -11,6 +12,12 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 type TranscriptionFn = Arc<dyn Fn(&Path) -> Result<String> + Send + Sync>;
+
+/// Built-in tool names handled by the conversation processor directly
+const BUILTIN_TOOLS: &[&str] = &["process_command", "speak", "type_text", "switch_mode"];
+
+/// Maximum MCP tool call iterations per conversation turn
+const MAX_MCP_ITERATIONS: usize = 5;
 
 /// Processor that handles bidirectional conversations with clarification
 pub struct ConversationProcessor {
@@ -23,6 +30,8 @@ pub struct ConversationProcessor {
     transcription_fn: Option<TranscriptionFn>,
     is_tts_speaking: Arc<Mutex<bool>>,
     tts_interrupt: Arc<AtomicBool>,
+    mcp_manager: Option<Arc<Mutex<McpManager>>>,
+    mcp_tools: Vec<serde_json::Value>,
 }
 
 impl ConversationProcessor {
@@ -45,6 +54,8 @@ impl ConversationProcessor {
             transcription_fn: None,
             is_tts_speaking,
             tts_interrupt,
+            mcp_manager: None,
+            mcp_tools: Vec::new(),
         }
     }
 
@@ -55,11 +66,41 @@ impl ConversationProcessor {
         context: &ConversationContext,
         mode: &VoiceMode,
     ) -> Result<LlmAnalysisResponse> {
-        let system_prompt = match mode {
+        let mut system_prompt = match mode {
             VoiceMode::Command => include_str!("../prompts/command.md").to_string(),
             VoiceMode::Code { .. } => include_str!("../prompts/code.md").to_string(),
             _ => include_str!("../prompts/assistant.md").to_string(),
         };
+
+        // Inject current date/time so the LLM always knows
+        let now = chrono::Local::now();
+        system_prompt.push_str(&format!(
+            "\n\n## CURRENT CONTEXT\n\n- **Date**: {}\n- **Time**: {}\n",
+            now.format("%A, %B %d, %Y"),
+            now.format("%I:%M %p")
+        ));
+
+        // Append MCP tool descriptions so the LLM knows what external tools are available
+        if !self.mcp_tools.is_empty() {
+            system_prompt.push_str("\n\n## EXTERNAL TOOLS (MCP)\n\n");
+            system_prompt.push_str(
+                "You also have access to external tools provided by MCP servers. \
+                 Use these tools when the user's request matches their capabilities. \
+                 After calling an external tool, use `speak` to tell the user the result.\n\n",
+            );
+            for tool in &self.mcp_tools {
+                if let (Some(name), Some(desc)) = (
+                    tool.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|n| n.as_str()),
+                    tool.get("function")
+                        .and_then(|f| f.get("description"))
+                        .and_then(|d| d.as_str()),
+                ) {
+                    system_prompt.push_str(&format!("- **`{}`**: {}\n", name, desc));
+                }
+            }
+        }
 
         let mut messages = vec![json!({
             "role": "system",
@@ -184,6 +225,11 @@ impl ConversationProcessor {
             }));
         }
 
+        // Append MCP tools
+        for mcp_tool in &self.mcp_tools {
+            tools.as_array_mut().unwrap().push(mcp_tool.clone());
+        }
+
         // In Command, Assistant, and Code modes, force tool usage to prevent unwanted typing
         let tool_choice = if matches!(
             mode,
@@ -194,155 +240,256 @@ impl ConversationProcessor {
             "auto"
         };
 
-        let request_body = json!({
-            "model": self.model,
-            "messages": messages,
-            "temperature": 0.3,
-            "tools": tools,
-            "tool_choice": tool_choice
-        });
+        eprintln!("[DEBUG] Total tools for LLM: {} (including {} MCP tools)",
+            tools.as_array().map(|a| a.len()).unwrap_or(0), self.mcp_tools.len());
 
-        let response = self
-            .http_client
-            .post(format!("{}/chat/completions", self.api_base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&request_body)
-            .send()
-            .await
-            .context("Failed to send analysis request")?;
+        // MCP tool call loop: iterate until we get a built-in tool call or content
+        for iteration in 0..=MAX_MCP_ITERATIONS {
+            let use_tool_choice = if iteration == 0 { tool_choice } else { "auto" };
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("API request failed: {} - {}", status, error_text);
-        }
+            let request_body = json!({
+                "model": self.model,
+                "messages": messages,
+                "temperature": 0.3,
+                "tools": tools,
+                "tool_choice": use_tool_choice
+            });
 
-        let response_json: serde_json::Value = response.json().await?;
+            let response = self
+                .http_client
+                .post(format!("{}/chat/completions", self.api_base_url))
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .header("Content-Type", "application/json")
+                .json(&request_body)
+                .send()
+                .await
+                .context("Failed to send analysis request")?;
 
-        eprintln!(
-            "[DEBUG] LLM Response: {}",
-            serde_json::to_string_pretty(&response_json).unwrap_or_default()
-        );
+            if !response.status().is_success() {
+                let status = response.status();
+                let error_text = response.text().await.unwrap_or_default();
+                anyhow::bail!("API request failed: {} - {}", status, error_text);
+            }
 
-        // Check for tool calls (same pattern as AssistantProcessor)
-        if let Some(tool_calls) = response_json["choices"][0]["message"]["tool_calls"].as_array() {
-            eprintln!("[DEBUG] Found {} tool calls", tool_calls.len());
-            if let Some(tool_call) = tool_calls.first() {
-                if let Some(tool_name) = tool_call["function"]["name"].as_str() {
-                    eprintln!("[DEBUG] Tool name: {}", tool_name);
+            let response_json: serde_json::Value = response.json().await?;
 
-                    if tool_name == "process_command" {
+            eprintln!(
+                "[DEBUG] LLM Response (iteration {}): {}",
+                iteration,
+                serde_json::to_string_pretty(&response_json).unwrap_or_default()
+            );
+
+            // Check for tool calls
+            if let Some(tool_calls_arr) =
+                response_json["choices"][0]["message"]["tool_calls"].as_array()
+            {
+                eprintln!("[DEBUG] Found {} tool calls", tool_calls_arr.len());
+                if let Some(tool_call) = tool_calls_arr.first() {
+                    if let Some(tool_name) = tool_call["function"]["name"].as_str() {
+                        let tool_id = tool_call["id"].as_str().unwrap_or("call_0");
+                        eprintln!("[DEBUG] Tool name: {}", tool_name);
+
                         if let Some(args_str) = tool_call["function"]["arguments"].as_str() {
                             eprintln!("[DEBUG] Tool args: {}", args_str);
-                            if let Ok(args) = serde_json::from_str::<serde_json::Value>(args_str) {
-                                if let Some(command) = args["command"].as_str() {
-                                    eprintln!("[DEBUG] Extracted command: {}", command);
-                                    // Return the command for execution
-                                    return Ok(LlmAnalysisResponse {
-                                        needs_clarification: false,
-                                        clarification_question: None,
-                                        response: Some(command.to_string()),
-                                        confidence: 1.0,
-                                    });
-                                }
+                            let args: serde_json::Value =
+                                serde_json::from_str(args_str).unwrap_or(json!({}));
+
+                            // Handle built-in tools
+                            if BUILTIN_TOOLS.contains(&tool_name) {
+                                return self.handle_builtin_tool(tool_name, &args, mode);
                             }
-                        }
-                    } else if tool_name == "speak" {
-                        if let Some(args_str) = tool_call["function"]["arguments"].as_str() {
-                            eprintln!("[DEBUG] Tool args: {}", args_str);
-                            if let Ok(args) = serde_json::from_str::<serde_json::Value>(args_str) {
-                                if let Some(speak_text) = args["text"].as_str() {
-                                    eprintln!("[DEBUG] Extracted speak text: {}", speak_text);
-                                    // Speak tool is for FINAL ANSWERS via TTS (not clarifications)
-                                    // We'll speak it in the handler and mark as complete
-                                    return Ok(LlmAnalysisResponse {
-                                        needs_clarification: false,
-                                        clarification_question: None,
-                                        response: Some(format!("🔊 {}", speak_text)),
-                                        confidence: 1.0,
-                                    });
-                                }
-                            }
-                        }
-                    } else if tool_name == "type_text" {
-                        if let Some(args_str) = tool_call["function"]["arguments"].as_str() {
-                            eprintln!("[DEBUG] Tool args: {}", args_str);
-                            if let Ok(args) = serde_json::from_str::<serde_json::Value>(args_str) {
-                                if let Some(type_text) = args["text"].as_str() {
-                                    eprintln!("[DEBUG] Extracted type text: {}", type_text);
-                                    // Return the text to be typed (not spoken)
-                                    return Ok(LlmAnalysisResponse {
-                                        needs_clarification: false,
-                                        clarification_question: None,
-                                        response: Some(type_text.to_string()),
-                                        confidence: 1.0,
-                                    });
-                                }
-                            }
-                        }
-                    } else if tool_name == "switch_mode" {
-                        if let Some(args_str) = tool_call["function"]["arguments"].as_str() {
-                            eprintln!("[DEBUG] Tool args: {}", args_str);
-                            if let Ok(args) = serde_json::from_str::<serde_json::Value>(args_str) {
-                                if let (Some(mode_str), Some(confirmation)) =
-                                    (args["mode"].as_str(), args["confirmation"].as_str())
-                                {
+
+                            // Handle MCP tools
+                            if let Some(ref mcp_mgr) = self.mcp_manager {
+                                if iteration >= MAX_MCP_ITERATIONS {
                                     eprintln!(
-                                        "[DEBUG] Mode switch request: {} with confirmation: {}",
-                                        mode_str, confirmation
+                                        "[DEBUG] Max MCP iterations ({}) reached",
+                                        MAX_MCP_ITERATIONS
                                     );
-                                    // Note: Mode switching is handled by the main loop's wake word detector
-                                    // We just need to speak the confirmation and return empty
-                                    return Ok(LlmAnalysisResponse {
-                                        needs_clarification: true,
-                                        clarification_question: Some(confirmation.to_string()),
-                                        response: None,
-                                        confidence: 1.0,
-                                    });
+                                    break;
                                 }
+
+                                let tool_result =
+                                    match mcp_mgr.lock().unwrap().call_tool(tool_name, args) {
+                                        Ok(result) => result,
+                                        Err(e) => {
+                                            format!("Error calling tool '{}': {}", tool_name, e)
+                                        }
+                                    };
+
+                                eprintln!(
+                                    "[DEBUG] MCP tool '{}' result: {}",
+                                    tool_name,
+                                    &tool_result[..tool_result.len().min(200)]
+                                );
+
+                                // Add assistant message with tool call
+                                messages.push(json!({
+                                    "role": "assistant",
+                                    "content": serde_json::Value::Null,
+                                    "tool_calls": [{
+                                        "id": tool_id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": tool_name,
+                                            "arguments": args_str
+                                        }
+                                    }]
+                                }));
+
+                                // Add tool result message
+                                messages.push(json!({
+                                    "role": "tool",
+                                    "tool_call_id": tool_id,
+                                    "content": tool_result
+                                }));
+
+                                continue; // Loop back to LLM with tool result
                             }
                         }
                     }
                 }
+            } else {
+                eprintln!("[DEBUG] No tool calls found in response");
             }
-        } else {
-            eprintln!("[DEBUG] No tool calls found in response");
-        }
 
-        // Fallback to content
-        if let Some(content) = response_json["choices"][0]["message"]["content"].as_str() {
-            eprintln!("[DEBUG] Using content: {}", content);
+            // Fallback to content
+            if let Some(content) = response_json["choices"][0]["message"]["content"].as_str() {
+                eprintln!("[DEBUG] Using content: {}", content);
 
-            // In bidirectional mode (Assistant/Command/Code), the LLM should ALWAYS use tools
-            // If it returns content directly, it's likely a mistake - return error
-            if matches!(
-                mode,
-                VoiceMode::Assistant { .. } | VoiceMode::Command | VoiceMode::Code { .. }
-            ) {
-                eprintln!(
-                    "[WARNING] LLM returned content instead of using a tool in bidirectional mode"
-                );
-                eprintln!("[WARNING] Content: {}", content);
+                // In bidirectional mode, the LLM should ALWAYS use tools
+                if matches!(
+                    mode,
+                    VoiceMode::Assistant { .. } | VoiceMode::Command | VoiceMode::Code { .. }
+                ) {
+                    eprintln!(
+                        "[WARNING] LLM returned content instead of using a tool in bidirectional mode"
+                    );
+                    eprintln!("[WARNING] Content: {}", content);
+                    return Ok(LlmAnalysisResponse {
+                        needs_clarification: false,
+                        clarification_question: None,
+                        response: Some("🔊 I had trouble understanding your request. Please try again with more specific details, or say 'type as is' if you want me to type exactly what you said.".to_string()),
+                        confidence: 0.0,
+                    });
+                }
+
                 return Ok(LlmAnalysisResponse {
                     needs_clarification: false,
                     clarification_question: None,
-                    response: Some("🔊 I had trouble understanding your request. Please try again with more specific details, or say 'type as is' if you want me to type exactly what you said.".to_string()),
-                    confidence: 0.0,
+                    response: Some(content.to_string()),
+                    confidence: 1.0,
                 });
             }
 
-            // In Dictation/Code modes, return content for typing (no tools available)
-            return Ok(LlmAnalysisResponse {
-                needs_clarification: false,
-                clarification_question: None,
-                response: Some(content.to_string()),
-                confidence: 1.0,
-            });
+            eprintln!("[DEBUG] No content or tool call found!");
+            anyhow::bail!("No content or tool call in LLM response");
         }
 
-        eprintln!("[DEBUG] No content or tool call found!");
-        anyhow::bail!("No content or tool call in LLM response")
+        // Exceeded max iterations
+        Ok(LlmAnalysisResponse {
+            needs_clarification: false,
+            clarification_question: None,
+            response: Some("🔊 I ran into a limit processing your request. Please try again.".to_string()),
+            confidence: 0.0,
+        })
+    }
+
+    /// Handle a built-in tool call and return the appropriate LlmAnalysisResponse
+    fn handle_builtin_tool(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        _mode: &VoiceMode,
+    ) -> Result<LlmAnalysisResponse> {
+        match tool_name {
+            "process_command" => {
+                if let Some(command) = args["command"].as_str() {
+                    eprintln!("[DEBUG] Extracted command: {}", command);
+                    Ok(LlmAnalysisResponse {
+                        needs_clarification: false,
+                        clarification_question: None,
+                        response: Some(command.to_string()),
+                        confidence: 1.0,
+                    })
+                } else {
+                    Ok(LlmAnalysisResponse {
+                        needs_clarification: false,
+                        clarification_question: None,
+                        response: None,
+                        confidence: 0.0,
+                    })
+                }
+            }
+            "speak" => {
+                if let Some(speak_text) = args["text"].as_str() {
+                    eprintln!("[DEBUG] Extracted speak text: {}", speak_text);
+                    Ok(LlmAnalysisResponse {
+                        needs_clarification: false,
+                        clarification_question: None,
+                        response: Some(format!("🔊 {}", speak_text)),
+                        confidence: 1.0,
+                    })
+                } else {
+                    Ok(LlmAnalysisResponse {
+                        needs_clarification: false,
+                        clarification_question: None,
+                        response: None,
+                        confidence: 0.0,
+                    })
+                }
+            }
+            "type_text" => {
+                if let Some(type_text) = args["text"].as_str() {
+                    eprintln!("[DEBUG] Extracted type text: {}", type_text);
+                    Ok(LlmAnalysisResponse {
+                        needs_clarification: false,
+                        clarification_question: None,
+                        response: Some(type_text.to_string()),
+                        confidence: 1.0,
+                    })
+                } else {
+                    Ok(LlmAnalysisResponse {
+                        needs_clarification: false,
+                        clarification_question: None,
+                        response: None,
+                        confidence: 0.0,
+                    })
+                }
+            }
+            "switch_mode" => {
+                if let (Some(mode_str), Some(confirmation)) =
+                    (args["mode"].as_str(), args["confirmation"].as_str())
+                {
+                    eprintln!(
+                        "[DEBUG] Mode switch request: {} with confirmation: {}",
+                        mode_str, confirmation
+                    );
+                    Ok(LlmAnalysisResponse {
+                        needs_clarification: true,
+                        clarification_question: Some(confirmation.to_string()),
+                        response: None,
+                        confidence: 1.0,
+                    })
+                } else {
+                    Ok(LlmAnalysisResponse {
+                        needs_clarification: false,
+                        clarification_question: None,
+                        response: None,
+                        confidence: 0.0,
+                    })
+                }
+            }
+            _ => {
+                eprintln!("[WARNING] Unknown built-in tool: {}", tool_name);
+                Ok(LlmAnalysisResponse {
+                    needs_clarification: false,
+                    clarification_question: None,
+                    response: None,
+                    confidence: 0.0,
+                })
+            }
+        }
     }
 
     /// Handle clarification by speaking the question and waiting for response
@@ -635,6 +782,18 @@ impl ConversationProcessor {
         F: Fn(&Path) -> Result<String> + Send + Sync + 'static,
     {
         self.transcription_fn = Some(Arc::new(f));
+    }
+
+    /// Set MCP manager and tool definitions for external tool support
+    pub fn set_mcp(&mut self, manager: Arc<Mutex<McpManager>>, tools: Vec<serde_json::Value>) {
+        eprintln!("[MCP] ConversationProcessor: {} MCP tools loaded", tools.len());
+        for tool in &tools {
+            if let Some(name) = tool.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()) {
+                eprintln!("[MCP]   - {}", name);
+            }
+        }
+        self.mcp_manager = Some(manager);
+        self.mcp_tools = tools;
     }
 
     /// Get the conversation context (for debugging/monitoring)
