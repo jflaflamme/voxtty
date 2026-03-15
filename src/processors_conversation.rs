@@ -31,7 +31,6 @@ pub struct ConversationProcessor {
     is_tts_speaking: Arc<Mutex<bool>>,
     tts_interrupt: Arc<AtomicBool>,
     mcp_manager: Option<Arc<Mutex<McpManager>>>,
-    mcp_tools: Vec<serde_json::Value>,
 }
 
 impl ConversationProcessor {
@@ -55,7 +54,6 @@ impl ConversationProcessor {
             is_tts_speaking,
             tts_interrupt,
             mcp_manager: None,
-            mcp_tools: Vec::new(),
         }
     }
 
@@ -80,15 +78,16 @@ impl ConversationProcessor {
             now.format("%I:%M %p")
         ));
 
-        // Append MCP tool descriptions so the LLM knows what external tools are available
-        if !self.mcp_tools.is_empty() {
+        // Append MCP tool descriptions dynamically from manager
+        let mcp_tools_snapshot = self.get_mcp_tools();
+        if !mcp_tools_snapshot.is_empty() {
             system_prompt.push_str("\n\n## EXTERNAL TOOLS (MCP)\n\n");
             system_prompt.push_str(
                 "You also have access to external tools provided by MCP servers. \
                  Use these tools when the user's request matches their capabilities. \
                  After calling an external tool, use `speak` to tell the user the result.\n\n",
             );
-            for tool in &self.mcp_tools {
+            for tool in &mcp_tools_snapshot {
                 if let (Some(name), Some(desc)) = (
                     tool.get("function")
                         .and_then(|f| f.get("name"))
@@ -225,8 +224,9 @@ impl ConversationProcessor {
             }));
         }
 
-        // Append MCP tools
-        for mcp_tool in &self.mcp_tools {
+        // Append MCP tools dynamically from manager
+        let mcp_tools_snapshot = self.get_mcp_tools();
+        for mcp_tool in &mcp_tools_snapshot {
             tools.as_array_mut().unwrap().push(mcp_tool.clone());
         }
 
@@ -240,8 +240,11 @@ impl ConversationProcessor {
             "auto"
         };
 
-        eprintln!("[DEBUG] Total tools for LLM: {} (including {} MCP tools)",
-            tools.as_array().map(|a| a.len()).unwrap_or(0), self.mcp_tools.len());
+        eprintln!(
+            "[DEBUG] Total tools for LLM: {} (including {} MCP tools)",
+            tools.as_array().map(|a| a.len()).unwrap_or(0),
+            mcp_tools_snapshot.len()
+        );
 
         // MCP tool call loop: iterate until we get a built-in tool call or content
         for iteration in 0..=MAX_MCP_ITERATIONS {
@@ -390,7 +393,9 @@ impl ConversationProcessor {
         Ok(LlmAnalysisResponse {
             needs_clarification: false,
             clarification_question: None,
-            response: Some("🔊 I ran into a limit processing your request. Please try again.".to_string()),
+            response: Some(
+                "🔊 I ran into a limit processing your request. Please try again.".to_string(),
+            ),
             confidence: 0.0,
         })
     }
@@ -784,16 +789,17 @@ impl ConversationProcessor {
         self.transcription_fn = Some(Arc::new(f));
     }
 
-    /// Set MCP manager and tool definitions for external tool support
-    pub fn set_mcp(&mut self, manager: Arc<Mutex<McpManager>>, tools: Vec<serde_json::Value>) {
-        eprintln!("[MCP] ConversationProcessor: {} MCP tools loaded", tools.len());
-        for tool in &tools {
-            if let Some(name) = tool.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()) {
-                eprintln!("[MCP]   - {}", name);
-            }
-        }
+    /// Set MCP manager for external tool support (tools are read dynamically)
+    pub fn set_mcp(&mut self, manager: Arc<Mutex<McpManager>>) {
         self.mcp_manager = Some(manager);
-        self.mcp_tools = tools;
+    }
+
+    /// Get MCP tools dynamically from manager (supports background init)
+    fn get_mcp_tools(&self) -> Vec<serde_json::Value> {
+        self.mcp_manager
+            .as_ref()
+            .map(|m| m.lock().unwrap().to_openai_tools())
+            .unwrap_or_default()
     }
 
     /// Get the conversation context (for debugging/monitoring)

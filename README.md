@@ -1,5 +1,7 @@
 # voxtty
 
+[![CI](https://github.com/jflaflamme/voxtty/actions/workflows/ci.yml/badge.svg)](https://github.com/jflaflamme/voxtty/actions/workflows/ci.yml)
+
 **Voice assistant that listens on Linux — say 'code mode' to switch, run local or cloud, type system-wide**
 
 voxtty is more than dictation — it's a voice-controlled assistant for Linux. Switch modes hands-free with wake words ("hey assistant", "code mode"), choose your backend (local Whisper or cloud AI), and type anywhere. System tray control, realtime streaming, and complete privacy when offline.
@@ -8,45 +10,37 @@ Built in Rust for reliability. Designed for developers who value control.
 
 ## 🚀 Quick Start
 
-### Installation Method 1: Debian Package (Recommended)
+### Install
 
 ```bash
-# 1. Install voxtty
-sudo dpkg -i voxtty_0.1.0-1_amd64.deb
+# Option 1: One-line installer (downloads pre-built binary or builds from source)
+curl -fsSL https://raw.githubusercontent.com/jflaflamme/voxtty/main/install.sh | bash
 
-# 2. Configure environment (add to ~/.bashrc for persistence)
-export YDOTOOL_SOCKET=/tmp/.ydotool_socket
-export SPEACHES_BASE_URL=http://localhost:8000/v1/audio/transcriptions
+# Option 2: Cargo (requires Rust toolchain + system deps)
+cargo install --git https://github.com/jflaflamme/voxtty
 
-# 3. Setup ydotool
+# Option 3: Build from source
+git clone https://github.com/jflaflamme/voxtty.git
+cd voxtty && cargo build --release
+sudo cp target/release/voxtty /usr/local/bin/
+```
+
+### Setup
+
+```bash
+# 1. Setup ydotool (required for typing into applications)
 sudo systemctl enable --now ydotool.service
+export YDOTOOL_SOCKET=/tmp/.ydotool_socket  # add to ~/.bashrc
 
-# 4. Start Speaches backend (Docker)
+# 2. Start Speaches backend (Docker)
 docker run -d --name speaches -p 8000:8000 \
   ghcr.io/speaches-ai/speaches:latest
 
-# 5. Test your microphone (IMPORTANT!)
-# After installing the .deb package, run voxtty from the command line:
+# 3. Test your microphone
 voxtty --echo-test
 
-# 6. Start voice typing
+# 4. Start voice typing
 voxtty --speaches --tray
-```
-
-### Installation Method 2: Standalone Binary (Development)
-
-```bash
-# 1. Build voxtty
-cargo build --release
-
-# 2. Set environment (per-session)
-export YDOTOOL_SOCKET=/tmp/.ydotool_socket
-
-# 3. Setup backend and ydotool (same as above)
-
-# 4. Run from build directory
-./target/release/voxtty --echo-test
-./target/release/voxtty --speaches --tray
 ```
 
 **That's it!** Click the tray icon to toggle voice typing on/off.
@@ -175,64 +169,46 @@ voxtty was inspired by [themanyone/voice_typing](https://github.com/themanyone/v
 
 ### Choose Your Installation Method
 
-| Method | Best For | Binary Location | Configuration |
-|--------|----------|-----------------|---------------|
-| **Debian Package** | End users, production | `/usr/bin/voxtty` | Add to `~/.bashrc` (persistent) |
-| **Standalone Binary** | Development, testing | `./target/release/voxtty` | Export per-session |
+| Method | Best For | Requirements |
+|--------|----------|--------------|
+| **curl \| bash** | Quick install, end users | curl or wget |
+| **cargo install** | Rust users | Rust toolchain + system deps |
+| **Build from source** | Development, contributing | Rust toolchain + system deps |
+| **Debian Package** | Custom packaging | debhelper, cargo |
 
-### Option 1: Debian Package (Recommended for End Users)
+### Option 1: One-line Installer (Recommended)
 
-**Pros**: System-wide installation, managed dependencies, easy updates  
-**Cons**: Requires sudo, system-wide changes
+Downloads a pre-built binary from GitHub Releases, or builds from source as fallback:
 
 ```bash
-# Download the latest release
-wget https://github.com/jflaflamme/voxtty/releases/latest/download/voxtty_0.1.0-1_amd64.deb
-
-# Install
-sudo dpkg -i voxtty_0.1.0-1_amd64.deb
-
-# Install dependencies if needed
-sudo apt-get install -f
-
-# Binary is now at /usr/bin/voxtty
-which voxtty
-
-# IMPORTANT: After installation, you must run voxtty from the command line
-# It does not create a desktop launcher - it's a CLI tool
-voxtty --help
+curl -fsSL https://raw.githubusercontent.com/jflaflamme/voxtty/main/install.sh | bash
 ```
 
-**Configuration**: Add environment variables to `~/.bashrc` for persistence:
+Installs to `~/.local/bin` by default. Override with `INSTALL_DIR`:
 ```bash
-echo 'export YDOTOOL_SOCKET=/tmp/.ydotool_socket' >> ~/.bashrc
-source ~/.bashrc
+INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/jflaflamme/voxtty/main/install.sh | bash
 ```
 
-### Option 2: Standalone Binary (Recommended for Development)
-
-**Pros**: No sudo needed, easy to update, isolated from system
-**Cons**: Manual dependency management, per-session config
+### Option 2: Cargo Install
 
 ```bash
-# Clone the repository
+# Requires: pkg-config libasound2-dev libatk1.0-dev libgtk-3-dev
+cargo install --git https://github.com/jflaflamme/voxtty
+```
+
+### Option 3: Build from Source
+
+```bash
 git clone https://github.com/jflaflamme/voxtty.git
 cd voxtty
-
-# Build release binary
 cargo build --release
-
-# Install to /usr/local/bin
 sudo cp target/release/voxtty /usr/local/bin/
-
-# Verify installation
-voxtty --version
 ```
 
-**Configuration**: Export environment variables per-session:
+### Build Dependencies (Ubuntu/Debian)
+
 ```bash
-export YDOTOOL_SOCKET=/tmp/.ydotool_socket
-voxtty --echo-test
+sudo apt install pkg-config libasound2-dev libatk1.0-dev libgtk-3-dev libgdk-pixbuf2.0-dev libssl-dev
 ```
 
 ### Option 3: Systemd User Service (Auto-start on Login)
@@ -601,8 +577,9 @@ voxtty --realtime --speaches --auto --tray
 | `--openai` | Use OpenAI for transcription |
 | `--assistant` | Enable assistant modes with wake word activation |
 | `--auto` | Enable voice commands without full assistant mode |
-| `--mcp` | **Enable MCP tool calling** (loads `~/.config/voxtty/mcp_servers.json`) |
-| `--mock-mcp` | Use built-in mock MCP server for testing (weather, dice, calc, etc.) |
+| `--tui-output` | Enable text output in TUI mode (types to active application) |
+| `--mcp` | **Enable MCP tool calling** (loads `~/.config/voxtty/mcp_servers.toml` or `.mcp.json`) |
+| `--mock-mcp` | Use built-in mock MCP server for testing (cannot combine with `--mcp`) |
 | `--bidirectional` | Enable bidirectional conversation with TTS responses |
 
 **Configuration Priority**: CLI flags → Environment variables → Defaults

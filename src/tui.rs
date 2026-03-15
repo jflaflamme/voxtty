@@ -80,6 +80,7 @@ pub struct AppState {
     pub is_processing: bool, // LLM is thinking (DEPRECATED - use processing_status)
     pub processing_status: ProcessingStatus, // Granular processing status
     pub current_conversation_id: usize, // ID to track conversation boundaries
+    pub mcp_info: Option<(usize, usize)>, // (server_count, tool_count) when MCP is enabled
 }
 
 impl Default for AppState {
@@ -113,6 +114,7 @@ impl Default for AppState {
             is_processing: false,
             processing_status: ProcessingStatus::Idle,
             current_conversation_id: 0,
+            mcp_info: None,
         }
     }
 }
@@ -633,6 +635,15 @@ impl TuiApp {
             }
         }
 
+        // Add MCP info if enabled
+        if let Some((servers, tools)) = state.mcp_info {
+            status_spans.push(Span::raw(" │ "));
+            status_spans.push(Span::styled(
+                format!("MCP: {}s/{}t", servers, tools),
+                Style::default().fg(Color::Cyan),
+            ));
+        }
+
         // Add version
         let version = env!("CARGO_PKG_VERSION");
         status_spans.push(Span::raw(" │ "));
@@ -870,7 +881,7 @@ impl TuiApp {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_millis();
-                let blink = (now / 500) % 2 == 0;
+                let blink = (now / 500).is_multiple_of(2);
 
                 // Determine status message and color based on processing_status
                 let (status_msg, status_color) = match state.processing_status {

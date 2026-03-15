@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 
 /// Sync state bidirectionally with TUI and tray
 /// Returns true if any state changed
+#[allow(clippy::too_many_arguments)]
 pub fn sync_state(
     enabled: &Arc<Mutex<bool>>,
     paused: &Arc<Mutex<bool>>,
@@ -79,7 +80,7 @@ pub fn sync_state(
 
             // Sync mode
             let mut m = mode.lock().unwrap();
-            if !matches_mode(&s.mode, &*m) {
+            if !matches_mode(&s.mode, &m) {
                 if !matches_mode(&s.mode, last_mode) {
                     // TUI changed -> update main & tray
                     *m = s.mode.clone();

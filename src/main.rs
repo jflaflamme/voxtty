@@ -522,10 +522,18 @@ struct Args {
     )]
     llm: Option<String>,
 
-    #[arg(long, help = "Enable MCP tool support (loads ~/.config/voxtty/mcp_servers.json)")]
+    #[arg(
+        long,
+        help = "Enable MCP tool support (loads ~/.config/voxtty/mcp_servers.toml or .mcp.json)",
+        conflicts_with = "mock_mcp"
+    )]
     mcp: bool,
 
-    #[arg(long, help = "Use a built-in mock MCP server for testing")]
+    #[arg(
+        long,
+        help = "Use a built-in mock MCP server for testing",
+        conflicts_with = "mcp"
+    )]
     mock_mcp: bool,
 }
 
@@ -1931,57 +1939,74 @@ fn main() -> Result<()> {
     };
     registry.register(Box::new(TranscriptionProcessor::new(transcription_config)));
 
-    // Load MCP tools if --mcp or --mock-mcp flag is set (before assistant/bidirectional blocks)
-    let mcp_manager: Option<Arc<Mutex<mcp_tools::McpManager>>> =
-        if args.mcp || args.mock_mcp {
-            let mcp_config = if args.mock_mcp {
-                // Built-in mock MCP server for testing
-                let mock_script = include_str!("../test_mcp_server.py");
-                let mock_path = std::env::temp_dir().join("voxtty_mock_mcp_server.py");
-                std::fs::write(&mock_path, mock_script).ok();
+    // Load MCP tools in a background thread to avoid blocking realtime connection
+    let mcp_manager: Option<Arc<Mutex<mcp_tools::McpManager>>> = if args.mcp || args.mock_mcp {
+        let mcp_config = if args.mock_mcp {
+            // Built-in mock MCP server for testing
+            let mock_script = include_str!("../test_mcp_server.py");
+            let mock_path = std::env::temp_dir().join("voxtty_mock_mcp_server.py");
+            std::fs::write(&mock_path, mock_script).ok();
 
-                mcp_tools::McpConfig {
-                    servers: vec![mcp_tools::McpServerConfig {
-                        name: "mock".to_string(),
-                        command: "python3".to_string(),
-                        args: vec![mock_path.to_string_lossy().to_string()],
-                        env: std::collections::HashMap::new(),
-                    }],
-                }
-            } else {
-                match mcp_tools::McpManager::load_config() {
-                    Ok(cfg) => cfg,
-                    Err(e) => {
-                        eprintln!("Warning: Failed to load MCP config: {}", e);
-                        eprintln!(
-                            "   Create ~/.config/voxtty/mcp_servers.json to configure MCP servers"
-                        );
-                        mcp_tools::McpConfig {
-                            servers: Vec::new(),
-                        }
-                    }
-                }
-            };
-
-            if !mcp_config.servers.is_empty() {
-                if tui_state.is_none() {
-                    println!("🔧 Connecting to MCP servers...");
-                }
-                let manager = mcp_tools::McpManager::from_config(&mcp_config);
-                if tui_state.is_none() {
-                    println!(
-                        "   {} server(s) connected, {} tool(s) available",
-                        manager.server_count(),
-                        manager.tool_count()
-                    );
-                }
-                Some(Arc::new(Mutex::new(manager)))
-            } else {
-                None
+            mcp_tools::McpConfig {
+                servers: vec![mcp_tools::McpServerConfig {
+                    name: "mock".to_string(),
+                    command: "python3".to_string(),
+                    args: vec![mock_path.to_string_lossy().to_string()],
+                    env: std::collections::HashMap::new(),
+                }],
             }
         } else {
-            None
+            match mcp_tools::McpManager::load_config() {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    eprintln!("Warning: Failed to load MCP config: {}", e);
+                    eprintln!(
+                            "   Create ~/.config/voxtty/mcp_servers.toml or .mcp.json to configure MCP servers"
+                        );
+                    mcp_tools::McpConfig {
+                        servers: Vec::new(),
+                    }
+                }
+            }
         };
+
+        if !mcp_config.servers.is_empty() {
+            // Create empty manager now, populate in background thread
+            let mgr = Arc::new(Mutex::new(mcp_tools::McpManager::empty()));
+            let mgr_bg = Arc::clone(&mgr);
+            let tui_state_bg = tui_state.clone();
+            let is_tui = tui_state.is_some();
+
+            std::thread::spawn(move || {
+                if !is_tui {
+                    eprintln!("🔧 Connecting to MCP servers...");
+                }
+                let manager = mcp_tools::McpManager::from_config(&mcp_config);
+                let server_count = manager.server_count();
+                let tool_count = manager.tool_count();
+                if !is_tui {
+                    eprintln!(
+                        "   {} server(s) connected, {} tool(s) available",
+                        server_count, tool_count
+                    );
+                }
+                // Replace empty manager with the initialized one
+                mgr_bg.lock().unwrap().replace_with(manager);
+                // Update TUI with MCP info
+                if let Some(ref state) = tui_state_bg {
+                    if let Ok(mut s) = state.lock() {
+                        s.mcp_info = Some((server_count, tool_count));
+                    }
+                }
+            });
+
+            Some(mgr)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     // Register assistant processor if enabled (--assistant or --auto)
     if args.assistant || args.auto {
@@ -2092,12 +2117,6 @@ fn main() -> Result<()> {
         // Only register AssistantProcessor if NOT in bidirectional mode
         // (bidirectional mode uses ConversationProcessor instead)
         if !args.bidirectional {
-            // Get MCP tool definitions for the LLM
-            let mcp_tool_defs = mcp_manager
-                .as_ref()
-                .map(|m| m.lock().unwrap().to_openai_tools())
-                .unwrap_or_default();
-
             let assistant_config = SpeachesAssistantConfig {
                 base_url: llm_base_url.clone(),
                 api_key: llm_api_key,
@@ -2107,7 +2126,6 @@ fn main() -> Result<()> {
                 llm_model: llm_model.clone(),
                 system_prompt: config.system_prompt.clone(),
                 code_system_prompt: config.code_system_prompt.clone(),
-                mcp_tools: mcp_tool_defs,
             };
             let mut backend = SpeachesAssistantBackend::new(assistant_config);
             if let Some(ref mgr) = mcp_manager {
@@ -2219,8 +2237,7 @@ fn main() -> Result<()> {
 
         // Inject MCP tools if available
         if let Some(ref mgr) = mcp_manager {
-            let mcp_tool_defs = mgr.lock().unwrap().to_openai_tools();
-            conversation_processor.set_mcp(Arc::clone(mgr), mcp_tool_defs);
+            conversation_processor.set_mcp(Arc::clone(mgr));
         }
 
         registry.register(Box::new(conversation_processor));
@@ -2772,9 +2789,7 @@ fn main() -> Result<()> {
                             // This handles providers like ElevenLabs that don't emit SpeechStarted
                             let was_tts_active = *is_tts_speaking.lock().unwrap();
                             if was_tts_active {
-                                eprintln!(
-                                    "🛑 User spoke during TTS - interrupting playback!"
-                                );
+                                eprintln!("🛑 User spoke during TTS - interrupting playback!");
                                 tts_interrupt.store(true, std::sync::atomic::Ordering::SeqCst);
                             }
 
@@ -3173,9 +3188,7 @@ fn main() -> Result<()> {
                         // Interrupt TTS if user starts speaking (barge-in)
                         let is_tts_active = *is_tts_speaking.lock().unwrap();
                         if is_tts_active {
-                            eprintln!(
-                                "🛑 User started speaking - interrupting AI playback!"
-                            );
+                            eprintln!("🛑 User started speaking - interrupting AI playback!");
                             tts_interrupt.store(true, std::sync::atomic::Ordering::SeqCst);
                         }
 
@@ -3286,7 +3299,10 @@ fn main() -> Result<()> {
                                     std::thread::spawn(move || {
                                         *is_tts_speaking_startup.lock().unwrap() = true;
                                         let rt = tokio::runtime::Runtime::new().unwrap();
-                                        match rt.block_on(tts.speak_and_play_interruptible(startup_message, Some(interrupt_for_startup))) {
+                                        match rt.block_on(tts.speak_and_play_interruptible(
+                                            startup_message,
+                                            Some(interrupt_for_startup),
+                                        )) {
                                             Ok(_) => {
                                                 eprintln!("✅ ElevenLabs TTS: Startup message spoken successfully");
                                             }
@@ -3735,20 +3751,23 @@ fn main() -> Result<()> {
                                                         let speak_text_owned =
                                                             speak_text.to_string();
                                                         let interrupt_clone = tts_interrupt.clone();
-                                                        let is_speaking_clone = is_tts_speaking.clone();
+                                                        let is_speaking_clone =
+                                                            is_tts_speaking.clone();
                                                         std::thread::spawn(move || {
-                                                            *is_speaking_clone.lock().unwrap() = true;
+                                                            *is_speaking_clone.lock().unwrap() =
+                                                                true;
                                                             let rt = tokio::runtime::Runtime::new()
                                                                 .unwrap();
-                                                            if let Err(e) =
-                                                                rt.block_on(tts.speak_and_play_interruptible(
+                                                            if let Err(e) = rt.block_on(
+                                                                tts.speak_and_play_interruptible(
                                                                     &speak_text_owned,
                                                                     Some(interrupt_clone),
-                                                                ))
-                                                            {
+                                                                ),
+                                                            ) {
                                                                 eprintln!("TTS Error: {}", e);
                                                             }
-                                                            *is_speaking_clone.lock().unwrap() = false;
+                                                            *is_speaking_clone.lock().unwrap() =
+                                                                false;
                                                         });
                                                     }
                                                     format!("🔊 {}", speak_text)
@@ -3816,17 +3835,23 @@ fn main() -> Result<()> {
                                                         let tts = create_elevenlabs_tts(&config);
                                                         let conf_text = confirmation.to_string();
                                                         let interrupt_clone = tts_interrupt.clone();
-                                                        let is_speaking_clone = is_tts_speaking.clone();
+                                                        let is_speaking_clone =
+                                                            is_tts_speaking.clone();
                                                         std::thread::spawn(move || {
-                                                            *is_speaking_clone.lock().unwrap() = true;
+                                                            *is_speaking_clone.lock().unwrap() =
+                                                                true;
                                                             let rt = tokio::runtime::Runtime::new()
                                                                 .unwrap();
                                                             if let Err(e) = rt.block_on(
-                                                                tts.speak_and_play_interruptible(&conf_text, Some(interrupt_clone)),
+                                                                tts.speak_and_play_interruptible(
+                                                                    &conf_text,
+                                                                    Some(interrupt_clone),
+                                                                ),
                                                             ) {
                                                                 eprintln!("TTS Error: {}", e);
                                                             }
-                                                            *is_speaking_clone.lock().unwrap() = false;
+                                                            *is_speaking_clone.lock().unwrap() =
+                                                                false;
                                                         });
                                                     }
                                                     format!("🔊 {}", confirmation)
@@ -3869,12 +3894,12 @@ fn main() -> Result<()> {
 
                                                             let rt = tokio::runtime::Runtime::new()
                                                                 .unwrap();
-                                                            if let Err(e) =
-                                                                rt.block_on(tts.speak_and_play_interruptible(
+                                                            if let Err(e) = rt.block_on(
+                                                                tts.speak_and_play_interruptible(
                                                                     &speak_text_owned,
                                                                     Some(interrupt_clone),
-                                                                ))
-                                                            {
+                                                                ),
+                                                            ) {
                                                                 eprintln!("TTS Error: {}", e);
                                                             }
 

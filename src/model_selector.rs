@@ -127,9 +127,7 @@ impl ModelSelector {
                     ModelProvider {
                         id: provider_info.id.clone(),
                         name: provider_info.name.clone(),
-                        base_url: cache
-                            .get_base_url(&provider_info.id)
-                            .unwrap_or_default(),
+                        base_url: cache.get_base_url(&provider_info.id).unwrap_or_default(),
                         requires_api_key: cache.requires_api_key(&provider_info.id),
                         models,
                     },

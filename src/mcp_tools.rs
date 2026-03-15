@@ -95,7 +95,11 @@ impl McpClient {
         current
     }
 
-    fn send_request(&mut self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+    fn send_request(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
         let id = self.next_id();
         let request = serde_json::json!({
             "jsonrpc": "2.0",
@@ -134,8 +138,13 @@ impl McpClient {
             anyhow::bail!("MCP server '{}' closed connection", self.name);
         }
 
-        let response: serde_json::Value = serde_json::from_str(line.trim())
-            .with_context(|| format!("Invalid JSON from MCP server '{}': {}", self.name, line.trim()))?;
+        let response: serde_json::Value = serde_json::from_str(line.trim()).with_context(|| {
+            format!(
+                "Invalid JSON from MCP server '{}': {}",
+                self.name,
+                line.trim()
+            )
+        })?;
 
         // Check for JSON-RPC error
         if let Some(error) = response.get("error") {
@@ -146,7 +155,10 @@ impl McpClient {
             anyhow::bail!("MCP server '{}' error: {}", self.name, msg);
         }
 
-        Ok(response.get("result").cloned().unwrap_or(serde_json::Value::Null))
+        Ok(response
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null))
     }
 
     fn initialize(&mut self) -> Result<()> {
@@ -177,9 +189,15 @@ impl McpClient {
         stdin.flush()?;
 
         if let Some(info) = result.get("serverInfo") {
-            let name = info.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
+            let name = info
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("unknown");
             let version = info.get("version").and_then(|v| v.as_str()).unwrap_or("?");
-            eprintln!("  MCP server '{}' initialized: {} v{}", self.name, name, version);
+            eprintln!(
+                "  MCP server '{}' initialized: {} v{}",
+                self.name, name, version
+            );
         }
 
         Ok(())
@@ -278,6 +296,19 @@ pub struct McpManager {
 }
 
 impl McpManager {
+    /// Create an empty manager with no servers
+    pub fn empty() -> Self {
+        Self {
+            clients: Vec::new(),
+            tool_routing: HashMap::new(),
+        }
+    }
+
+    /// Replace this manager's contents with a fully initialized one
+    pub fn replace_with(&mut self, other: McpManager) {
+        *self = other;
+    }
+
     /// Load config and connect to all MCP servers
     pub fn from_config(config: &McpConfig) -> Self {
         let mut clients = Vec::new();
@@ -332,9 +363,7 @@ impl McpManager {
             return Self::load_claude_code_config(claude_path);
         }
 
-        anyhow::bail!(
-            "No MCP config found. Create ~/.config/voxtty/mcp_servers.toml or .mcp.json"
-        )
+        anyhow::bail!("No MCP config found. Create ~/.config/voxtty/mcp_servers.toml or .mcp.json")
     }
 
     /// Parse Claude Code .mcp.json format into voxtty McpConfig
@@ -414,7 +443,10 @@ impl McpManager {
 
     /// Convert all tools to OpenAI-compatible format
     pub fn to_openai_tools(&self) -> Vec<serde_json::Value> {
-        self.all_tools().iter().map(|t| t.to_openai_tool()).collect()
+        self.all_tools()
+            .iter()
+            .map(|t| t.to_openai_tool())
+            .collect()
     }
 
     /// Call a tool by name, routing to the correct server

@@ -119,8 +119,8 @@ impl ModelsCache {
 
     /// Fetch fresh data from models.dev API
     pub fn fetch_from_api() -> Result<HashMap<String, ProviderInfo>> {
-        let response = reqwest::blocking::get(MODELS_DEV_API)
-            .context("Failed to fetch models.dev API")?;
+        let response =
+            reqwest::blocking::get(MODELS_DEV_API).context("Failed to fetch models.dev API")?;
 
         if !response.status().is_success() {
             anyhow::bail!("models.dev API returned status: {}", response.status());

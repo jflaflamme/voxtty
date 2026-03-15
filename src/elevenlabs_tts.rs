@@ -42,7 +42,7 @@ struct TtsMessage {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(non_snake_case)]
+#[allow(non_snake_case, dead_code)]
 struct TtsResponse {
     audio: Option<String>,
     #[serde(default)]

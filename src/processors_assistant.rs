@@ -85,7 +85,6 @@ pub struct SpeachesAssistantConfig {
     pub llm_model: String,
     pub system_prompt: String,
     pub code_system_prompt: String,
-    pub mcp_tools: Vec<serde_json::Value>,
 }
 
 pub struct SpeachesAssistantBackend {
@@ -298,21 +297,20 @@ impl SpeachesAssistantBackend {
             tools.as_array_mut().unwrap().push(switch_mode_tool);
         }
 
-        // Append MCP tools
-        for mcp_tool in &self.config.mcp_tools {
-            tools.as_array_mut().unwrap().push(mcp_tool.clone());
-            has_tools = true;
+        // Append MCP tools dynamically from manager (supports background init)
+        if let Some(ref mgr) = self.mcp_manager {
+            let mcp_tools = mgr.lock().unwrap().to_openai_tools();
+            for mcp_tool in mcp_tools {
+                tools.as_array_mut().unwrap().push(mcp_tool);
+                has_tools = true;
+            }
         }
 
         (tools, has_tools)
     }
 
     /// Send a chat completion request and parse the response
-    fn send_chat_request(
-        &self,
-        body: &serde_json::Value,
-        debug: bool,
-    ) -> Result<ChatResponse> {
+    fn send_chat_request(&self, body: &serde_json::Value, debug: bool) -> Result<ChatResponse> {
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()?;
@@ -362,24 +360,27 @@ impl SpeachesAssistantBackend {
             now.format("%I:%M %p")
         ));
 
-        // Append MCP tool descriptions so the LLM knows what external tools are available
-        if !self.config.mcp_tools.is_empty() {
-            system_prompt.push_str("\n\n## EXTERNAL TOOLS (MCP)\n\n");
-            system_prompt.push_str(
-                "You also have access to external tools provided by MCP servers. \
-                 Use these tools when the user's request matches their capabilities. \
-                 After calling an external tool, use `speak` to tell the user the result.\n\n",
-            );
-            for tool in &self.config.mcp_tools {
-                if let (Some(name), Some(desc)) = (
-                    tool.get("function")
-                        .and_then(|f| f.get("name"))
-                        .and_then(|n| n.as_str()),
-                    tool.get("function")
-                        .and_then(|f| f.get("description"))
-                        .and_then(|d| d.as_str()),
-                ) {
-                    system_prompt.push_str(&format!("- **`{}`**: {}\n", name, desc));
+        // Append MCP tool descriptions dynamically from manager
+        if let Some(ref mgr) = self.mcp_manager {
+            let mcp_tools = mgr.lock().unwrap().to_openai_tools();
+            if !mcp_tools.is_empty() {
+                system_prompt.push_str("\n\n## EXTERNAL TOOLS (MCP)\n\n");
+                system_prompt.push_str(
+                    "You also have access to external tools provided by MCP servers. \
+                     Use these tools when the user's request matches their capabilities. \
+                     After calling an external tool, use `speak` to tell the user the result.\n\n",
+                );
+                for tool in &mcp_tools {
+                    if let (Some(name), Some(desc)) = (
+                        tool.get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|n| n.as_str()),
+                        tool.get("function")
+                            .and_then(|f| f.get("description"))
+                            .and_then(|d| d.as_str()),
+                    ) {
+                        system_prompt.push_str(&format!("- **`{}`**: {}\n", name, desc));
+                    }
                 }
             }
         }
@@ -457,7 +458,11 @@ impl SpeachesAssistantBackend {
                             return Ok(message.content.clone().unwrap_or_default());
                         }
 
-                        let tool_result = match mcp_mgr.lock().unwrap().call_tool(tool_name, args_value.clone()) {
+                        let tool_result = match mcp_mgr
+                            .lock()
+                            .unwrap()
+                            .call_tool(tool_name, args_value.clone())
+                        {
                             Ok(result) => result,
                             Err(e) => format!("Error calling tool '{}': {}", tool_name, e),
                         };
