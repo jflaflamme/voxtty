@@ -1977,6 +1977,13 @@ fn main() -> Result<()> {
             let tui_state_bg = tui_state.clone();
             let is_tui = tui_state.is_some();
 
+            // Show loading state in TUI immediately
+            if let Some(ref state) = tui_state {
+                if let Ok(mut s) = state.lock() {
+                    s.mcp_info = Some((0, 0));
+                }
+            }
+
             std::thread::spawn(move || {
                 if !is_tui {
                     eprintln!("🔧 Connecting to MCP servers...");

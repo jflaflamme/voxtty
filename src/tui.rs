@@ -638,10 +638,17 @@ impl TuiApp {
         // Add MCP info if enabled
         if let Some((servers, tools)) = state.mcp_info {
             status_spans.push(Span::raw(" │ "));
-            status_spans.push(Span::styled(
-                format!("MCP: {}s/{}t", servers, tools),
-                Style::default().fg(Color::Cyan),
-            ));
+            if servers == 0 && tools == 0 {
+                status_spans.push(Span::styled(
+                    "MCP: loading...",
+                    Style::default().fg(Color::Yellow),
+                ));
+            } else {
+                status_spans.push(Span::styled(
+                    format!("MCP: {}s/{}t", servers, tools),
+                    Style::default().fg(Color::Cyan),
+                ));
+            }
         }
 
         // Add version
