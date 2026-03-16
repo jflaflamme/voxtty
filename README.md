@@ -17,7 +17,7 @@ Built in Rust. Runs offline. Your voice never leaves unless you say so.
 curl -fsSL https://raw.githubusercontent.com/jflaflamme/voxtty/main/install.sh | bash
 
 # Option 2: Cargo (requires Rust toolchain + system deps)
-cargo install --git https://github.com/jflaflamme/voxtty
+cargo install voxtty
 
 # Option 3: Build from source
 git clone https://github.com/jflaflamme/voxtty.git
@@ -193,7 +193,7 @@ INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/jflaflam
 
 ```bash
 # Requires: pkg-config libasound2-dev libatk1.0-dev libgtk-3-dev
-cargo install --git https://github.com/jflaflamme/voxtty
+cargo install voxtty
 ```
 
 ### Option 3: Build from Source
