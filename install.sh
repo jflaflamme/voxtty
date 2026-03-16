@@ -6,6 +6,7 @@ set -euo pipefail
 REPO="jflaflamme/voxtty"
 BINARY="voxtty"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
+CLEANUP_DIR=""
 
 # Colors
 RED='\033[0;31m'
@@ -58,10 +59,9 @@ download_and_install() {
     local version="$2"
     local asset="voxtty-${version}-${platform}.tar.gz"
     local url="https://github.com/${REPO}/releases/download/${version}/${asset}"
-    local tmpdir
-
-    tmpdir="$(mktemp -d)"
-    trap 'rm -rf "$tmpdir"' EXIT
+    CLEANUP_DIR="$(mktemp -d)"
+    trap 'rm -rf "$CLEANUP_DIR"' EXIT
+    local tmpdir="$CLEANUP_DIR"
 
     info "Downloading ${asset}..."
     if command -v curl &>/dev/null; then
@@ -90,9 +90,9 @@ build_from_source() {
     # Check build dependencies
     check_build_deps
 
-    local tmpdir
-    tmpdir="$(mktemp -d)"
-    trap 'rm -rf "$tmpdir"' EXIT
+    CLEANUP_DIR="$(mktemp -d)"
+    trap 'rm -rf "$CLEANUP_DIR"' EXIT
+    local tmpdir="$CLEANUP_DIR"
 
     info "Cloning repository..."
     git clone --depth 1 "https://github.com/${REPO}.git" "${tmpdir}/voxtty"
@@ -157,7 +157,7 @@ check_path() {
 main() {
     echo ""
     echo -e "${CYAN}voxtty installer${NC}"
-    echo -e "${CYAN}Voice-to-text for Linux${NC}"
+    echo -e "${CYAN}The power of whisper — your voice commands${NC}"
     echo ""
 
     local platform

@@ -2,11 +2,11 @@
 
 [![CI](https://github.com/jflaflamme/voxtty/actions/workflows/ci.yml/badge.svg)](https://github.com/jflaflamme/voxtty/actions/workflows/ci.yml)
 
-**Voice assistant that listens on Linux — say 'code mode' to switch, run local or cloud, type system-wide**
+**The power of whisper — your voice commands.**
 
-voxtty is more than dictation — it's a voice-controlled assistant for Linux. Switch modes hands-free with wake words ("hey assistant", "code mode"), choose your backend (local Whisper or cloud AI), and type anywhere. System tray control, realtime streaming, and complete privacy when offline.
+voxtty turns your voice into action. Dictate, code, command, and converse — switch modes hands-free, choose your backend (local Whisper or cloud AI), and type anywhere. Private by default, limitless by design.
 
-Built in Rust for reliability. Designed for developers who value control.
+Built in Rust. Runs offline. Your voice never leaves unless you say so.
 
 ## 🚀 Quick Start
 
@@ -952,4 +952,4 @@ This project is licensed under the GNU General Public License v2.0 - see the [LI
 
 **Made with ❤️ by Jeff Laflamme**
 
-*Privacy-focused voice typing for everyone*
+*The power of whisper — your voice commands*
