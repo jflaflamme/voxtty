@@ -21,6 +21,9 @@ pub struct TranscriptionConfig {
     pub whisper_url: String,
     pub openai_url: String,
     pub openai_api_key: String,
+    /// Model name sent to the OpenAI-compatible transcription endpoint.
+    /// "whisper-1" for OpenAI cloud; overridable for local servers (e.g. "Whisper-Base").
+    pub openai_model: String,
 }
 
 /// Direct transcription processor
@@ -72,7 +75,9 @@ impl TranscriptionProcessor {
 
         let form = reqwest::blocking::multipart::Form::new()
             .text("temperature", "0.2")
-            .text("response-format", "text")
+            // OpenAI-style underscore param; the hyphenated form is ignored by
+            // whisper.cpp (returns JSON instead of plain text).
+            .text("response_format", "text")
             .part(
                 "file",
                 reqwest::blocking::multipart::Part::bytes(file).file_name(
@@ -90,7 +95,13 @@ impl TranscriptionProcessor {
             .send()?
             .text()?;
 
-        Ok(response.trim().to_string())
+        // Accept either plain text or a JSON {"text": ...} envelope.
+        let body = response.trim();
+        let text = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(str::to_string))
+            .unwrap_or_else(|| body.to_string());
+        Ok(text.trim().to_string())
     }
 
     fn transcribe_openai(&self, audio_path: &Path) -> Result<String> {
@@ -98,7 +109,7 @@ impl TranscriptionProcessor {
         let file = std::fs::read(audio_path)?;
 
         let form = reqwest::blocking::multipart::Form::new()
-            .text("model", "whisper-1")
+            .text("model", self.config.openai_model.clone())
             .part(
                 "file",
                 reqwest::blocking::multipart::Part::bytes(file)
@@ -117,14 +128,17 @@ impl TranscriptionProcessor {
             text: String,
         }
 
-        let response = client
-            .post(&self.config.openai_url)
-            .header(
+        let mut request = client.post(&self.config.openai_url).multipart(form);
+
+        // Local OpenAI-compatible servers (e.g. Lemonade) usually need no auth.
+        if !self.config.openai_api_key.is_empty() {
+            request = request.header(
                 "Authorization",
                 format!("Bearer {}", self.config.openai_api_key),
-            )
-            .multipart(form)
-            .send()?;
+            );
+        }
+
+        let response = request.send()?;
 
         if !response.status().is_success() {
             let status = response.status();

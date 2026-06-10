@@ -1,7 +1,7 @@
 // Bidirectional conversation processor with clarification support
 use crate::conversation::{ConversationContext, ConversationState, LlmAnalysisResponse};
-use crate::elevenlabs_tts::ElevenLabsTts;
 use crate::mcp_tools::McpManager;
+use crate::tts_client::TtsClient;
 use crate::processors::{AudioProcessor, ProcessContext, VoiceMode};
 use anyhow::{Context, Result};
 use reqwest::Client;
@@ -26,7 +26,7 @@ pub struct ConversationProcessor {
     api_key: String,
     model: String,
     context: Arc<Mutex<ConversationContext>>,
-    tts_client: Option<Arc<ElevenLabsTts>>,
+    tts_client: Option<Arc<TtsClient>>,
     transcription_fn: Option<TranscriptionFn>,
     is_tts_speaking: Arc<Mutex<bool>>,
     tts_interrupt: Arc<AtomicBool>,
@@ -39,7 +39,7 @@ impl ConversationProcessor {
         api_base_url: String,
         api_key: String,
         model: String,
-        tts_client: Arc<ElevenLabsTts>,
+        tts_client: Arc<TtsClient>,
         is_tts_speaking: Arc<Mutex<bool>>,
         tts_interrupt: Arc<AtomicBool>,
     ) -> Self {
@@ -77,6 +77,9 @@ impl ConversationProcessor {
             now.format("%A, %B %d, %Y"),
             now.format("%I:%M %p")
         ));
+
+        // Inject user skills dropped in ~/.config/voxtty/skills/*.md (hot-reloaded).
+        system_prompt.push_str(&crate::skills::skills_prompt_section());
 
         // Append MCP tool descriptions dynamically from manager
         let mcp_tools_snapshot = self.get_mcp_tools();
@@ -230,15 +233,12 @@ impl ConversationProcessor {
             tools.as_array_mut().unwrap().push(mcp_tool.clone());
         }
 
-        // In Command, Assistant, and Code modes, force tool usage to prevent unwanted typing
-        let tool_choice = if matches!(
-            mode,
-            VoiceMode::Command | VoiceMode::Assistant { .. } | VoiceMode::Code { .. }
-        ) {
-            "required"
-        } else {
-            "auto"
-        };
+        // NOTE: We always use "auto" rather than "required". llama.cpp-backed
+        // servers (e.g. Lemonade) return 500 "Context size has been exceeded" for
+        // tool_choice="required" (it forces grammar-constrained decoding that blows
+        // the context budget). The system prompts already push strong tool usage.
+        // TODO(tool-choice): make this provider-configurable; cloud OpenAI supports "required".
+        let tool_choice = "auto";
 
         eprintln!(
             "[DEBUG] Total tools for LLM: {} (including {} MCP tools)",
@@ -258,12 +258,19 @@ impl ConversationProcessor {
                 "tool_choice": use_tool_choice
             });
 
-            let response = self
+            let mut request = self
                 .http_client
                 .post(format!("{}/chat/completions", self.api_base_url))
-                .header("Authorization", format!("Bearer {}", self.api_key))
                 .header("Content-Type", "application/json")
-                .json(&request_body)
+                .json(&request_body);
+
+            // Only send auth when a key is configured. A bare `Authorization:
+            // Bearer ` (empty token) makes local llama.cpp servers (Lemonade) 500.
+            if !self.api_key.is_empty() {
+                request = request.header("Authorization", format!("Bearer {}", self.api_key));
+            }
+
+            let response = request
                 .send()
                 .await
                 .context("Failed to send analysis request")?;
@@ -360,20 +367,28 @@ impl ConversationProcessor {
             if let Some(content) = response_json["choices"][0]["message"]["content"].as_str() {
                 eprintln!("[DEBUG] Using content: {}", content);
 
-                // In bidirectional mode, the LLM should ALWAYS use tools
-                if matches!(
-                    mode,
-                    VoiceMode::Assistant { .. } | VoiceMode::Command | VoiceMode::Code { .. }
-                ) {
-                    eprintln!(
-                        "[WARNING] LLM returned content instead of using a tool in bidirectional mode"
-                    );
-                    eprintln!("[WARNING] Content: {}", content);
+                // Command mode needs a structured `process_command` tool call; if
+                // the model answered in prose there's no command to run.
+                if matches!(mode, VoiceMode::Command) {
+                    eprintln!("[WARNING] Command mode: LLM returned content instead of a tool");
                     return Ok(LlmAnalysisResponse {
                         needs_clarification: false,
                         clarification_question: None,
-                        response: Some("🔊 I had trouble understanding your request. Please try again with more specific details, or say 'type as is' if you want me to type exactly what you said.".to_string()),
+                        response: Some("🔊 I had trouble understanding that command. Please try again with more specific details.".to_string()),
                         confidence: 0.0,
+                    });
+                }
+
+                // Assistant/Code modes: small local models often answer in plain
+                // content instead of calling the `speak` tool. Don't discard a
+                // usable answer — speak it directly (🔊 prefix routes it to TTS).
+                if matches!(mode, VoiceMode::Assistant { .. } | VoiceMode::Code { .. }) {
+                    eprintln!("[WARNING] LLM returned content instead of a tool; speaking it directly");
+                    return Ok(LlmAnalysisResponse {
+                        needs_clarification: false,
+                        clarification_question: None,
+                        response: Some(format!("🔊 {}", content.trim())),
+                        confidence: 0.8,
                     });
                 }
 
@@ -502,7 +517,7 @@ impl ConversationProcessor {
         eprintln!("🤔 Clarification needed: {}", question);
 
         if let Some(tts) = &self.tts_client {
-            eprintln!("🔊 Speaking question via ElevenLabs...");
+            eprintln!("🔊 Speaking question...");
             let tts_clone = Arc::clone(tts);
             let question_owned = question.to_string();
             let is_speaking_clone = Arc::clone(&self.is_tts_speaking);
@@ -513,10 +528,9 @@ impl ConversationProcessor {
             let interrupt_clone = Arc::clone(&self.tts_interrupt);
             std::thread::spawn(move || {
                 eprintln!("[DEBUG TTS Thread] Starting clarification TTS playback");
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                if let Err(e) = rt.block_on(
-                    tts_clone.speak_and_play_interruptible(&question_owned, Some(interrupt_clone)),
-                ) {
+                if let Err(e) =
+                    tts_clone.speak_blocking(&question_owned, Some(interrupt_clone))
+                {
                     eprintln!("❌ TTS Error: {}", e);
                 }
                 *is_speaking_clone.lock().unwrap() = false;
@@ -563,6 +577,18 @@ impl AudioProcessor for ConversationProcessor {
             let current_state = {
                 let ctx = self.context.lock().unwrap();
                 ctx.state.clone()
+            };
+
+            // A finished turn (ReadyToExecute/Completed) must start fresh on the
+            // NEXT utterance rather than swallowing it to reset state. Normalize
+            // terminal states to Idle (clearing the previous turn) so the new
+            // utterance is processed as a new conversation below.
+            let current_state = match current_state {
+                ConversationState::ReadyToExecute | ConversationState::Completed => {
+                    self.context.lock().unwrap().reset();
+                    ConversationState::Idle
+                }
+                other => other,
             };
 
             match current_state {
@@ -630,7 +656,7 @@ impl AudioProcessor for ConversationProcessor {
 
                                 // Speak via TTS in background
                                 if let Some(tts) = &self.tts_client {
-                                    eprintln!("🔊 Speaking final answer via ElevenLabs...");
+                                    eprintln!("🔊 Speaking final answer...");
                                     let tts_clone = Arc::clone(tts);
                                     let speak_text_owned = speak_text.to_string();
                                     let is_speaking_clone = Arc::clone(&self.is_tts_speaking);
@@ -641,8 +667,7 @@ impl AudioProcessor for ConversationProcessor {
                                     let interrupt_clone = Arc::clone(&self.tts_interrupt);
                                     std::thread::spawn(move || {
                                         eprintln!("[DEBUG TTS Thread] Starting TTS playback");
-                                        let rt = tokio::runtime::Runtime::new().unwrap();
-                                        if let Err(e) = rt.block_on(tts_clone.speak_and_play_interruptible(&speak_text_owned, Some(interrupt_clone))) {
+                                        if let Err(e) = tts_clone.speak_blocking(&speak_text_owned, Some(interrupt_clone)) {
                                             eprintln!("❌ TTS Error: {}", e);
                                         }
                                         *is_speaking_clone.lock().unwrap() = false;
@@ -718,7 +743,7 @@ impl AudioProcessor for ConversationProcessor {
 
                                 // Speak via TTS in background
                                 if let Some(tts) = &self.tts_client {
-                                    eprintln!("🔊 Speaking final answer via ElevenLabs...");
+                                    eprintln!("🔊 Speaking final answer...");
                                     let tts_clone = Arc::clone(tts);
                                     let speak_text_owned = speak_text.to_string();
                                     let is_speaking_clone = Arc::clone(&self.is_tts_speaking);
@@ -729,8 +754,7 @@ impl AudioProcessor for ConversationProcessor {
                                     let interrupt_clone = Arc::clone(&self.tts_interrupt);
                                     std::thread::spawn(move || {
                                         eprintln!("[DEBUG TTS Thread] Starting TTS playback");
-                                        let rt = tokio::runtime::Runtime::new().unwrap();
-                                        if let Err(e) = rt.block_on(tts_clone.speak_and_play_interruptible(&speak_text_owned, Some(interrupt_clone))) {
+                                        if let Err(e) = tts_clone.speak_blocking(&speak_text_owned, Some(interrupt_clone)) {
                                             eprintln!("❌ TTS Error: {}", e);
                                         }
                                         *is_speaking_clone.lock().unwrap() = false;
@@ -886,7 +910,7 @@ impl ConversationProcessor {
 
                         // Speak via TTS in background
                         if let Some(tts) = &self.tts_client {
-                            eprintln!("🔊 Speaking final answer via ElevenLabs...");
+                            eprintln!("🔊 Speaking final answer...");
                             let tts_clone = Arc::clone(tts);
                             let speak_text_owned = speak_text.to_string();
                             let is_speaking_clone = Arc::clone(&self.is_tts_speaking);
@@ -897,11 +921,9 @@ impl ConversationProcessor {
                             let interrupt_clone = Arc::clone(&self.tts_interrupt);
                             std::thread::spawn(move || {
                                 eprintln!("[DEBUG process_text Thread] Starting TTS playback");
-                                let rt = tokio::runtime::Runtime::new().unwrap();
-                                if let Err(e) = rt.block_on(tts_clone.speak_and_play_interruptible(
-                                    &speak_text_owned,
-                                    Some(interrupt_clone),
-                                )) {
+                                if let Err(e) = tts_clone
+                                    .speak_blocking(&speak_text_owned, Some(interrupt_clone))
+                                {
                                     eprintln!("❌ TTS Error: {}", e);
                                 }
                                 *is_speaking_clone.lock().unwrap() = false;

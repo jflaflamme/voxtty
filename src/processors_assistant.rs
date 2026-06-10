@@ -106,11 +106,13 @@ impl SpeachesAssistantBackend {
     }
 
     fn get_system_prompt(&self, mode: &VoiceMode) -> String {
-        match mode {
+        let base = match mode {
             VoiceMode::Code { .. } => self.config.code_system_prompt.clone(),
             VoiceMode::Command => include_str!("../prompts/command.md").to_string(),
             _ => self.config.system_prompt.clone(),
-        }
+        };
+        // Append user skills dropped in ~/.config/voxtty/skills/*.md (hot-reloaded).
+        format!("{}{}", base, crate::skills::skills_prompt_section())
     }
 
     fn transcribe_audio(&self, audio_path: &Path, debug: bool) -> Result<String> {

@@ -20,6 +20,10 @@ pub enum RealtimeProvider {
     Speaches,
     /// ElevenLabs ScribeRealtime v2
     ElevenLabs,
+    /// Local whisper.cpp server: no realtime WebSocket protocol exists, so this
+    /// fakes streaming with a sliding-window loop over the batch /inference endpoint.
+    /// Lets GPU-accelerated whisper.cpp (Vulkan/ROCm) back a realtime-feel session.
+    WhisperCppLocal,
 }
 
 /// Configuration for realtime transcription
@@ -220,10 +224,17 @@ impl RealtimeTranscriber {
         *running.lock() = true;
 
         thread::spawn(move || {
-            if let Err(e) = run_websocket_loop(config.clone(), event_rx, transcription_tx, running)
-            {
+            let result = match config.provider {
+                // Local whisper.cpp has no WebSocket realtime endpoint — use the
+                // sliding-window loop over its batch /inference endpoint instead.
+                RealtimeProvider::WhisperCppLocal => {
+                    run_sliding_window_loop(config.clone(), event_rx, transcription_tx, running)
+                }
+                _ => run_websocket_loop(config.clone(), event_rx, transcription_tx, running),
+            };
+            if let Err(e) = result {
                 if !config.quiet {
-                    eprintln!("[Realtime] WebSocket error: {}", e);
+                    eprintln!("[Realtime] error: {}", e);
                 }
             }
         });
@@ -401,6 +412,213 @@ fn run_websocket_loop(
     Ok(())
 }
 
+// ============================================================================
+// Local whisper.cpp sliding-window loop (pseudo-realtime over batch /inference)
+// ============================================================================
+
+/// How often to re-transcribe the in-progress utterance for a partial result.
+const PARTIAL_WINDOW_MS: u64 = 500;
+/// Trailing silence that finalizes an utterance.
+const SILENCE_FINALIZE_MS: u64 = 900;
+/// Peak-amplitude threshold (i16) above which a chunk counts as speech.
+const VAD_ENERGY_THRESHOLD: i16 = 600;
+/// Cap on buffered utterance length so a long monologue can't make each
+/// re-transcription unbounded (re-decoding the whole buffer every window).
+const MAX_UTTERANCE_SECS: f32 = 30.0;
+
+/// Drive whisper.cpp's batch /inference endpoint as a pseudo-realtime stream.
+///
+/// We accumulate mic audio, run a simple energy VAD, periodically re-transcribe
+/// the growing utterance (emitting `Partial`), and finalize on trailing silence
+/// (emitting `Final`). The transcription itself runs on whisper.cpp, so it picks
+/// up whatever acceleration that server was built with (Vulkan/ROCm on AMD).
+fn run_sliding_window_loop(
+    config: RealtimeConfig,
+    event_rx: Receiver<RealtimeEvent>,
+    transcription_tx: Sender<TranscriptionEvent>,
+    running: Arc<Mutex<bool>>,
+) -> Result<()> {
+    use std::time::{Duration, Instant};
+
+    let url = config
+        .base_url
+        .clone()
+        .context("WhisperCppLocal requires a base_url (whisper.cpp /inference endpoint)")?;
+
+    if !config.quiet {
+        println!("[Realtime] Local whisper.cpp sliding-window mode -> {}", url);
+    }
+    let _ = transcription_tx.send(TranscriptionEvent::Connecting);
+    let _ = transcription_tx.send(TranscriptionEvent::Connected);
+
+    let client = reqwest::blocking::Client::new();
+    let sample_rate = config.sample_rate.max(1);
+    let partial_window = Duration::from_millis(PARTIAL_WINDOW_MS);
+    let silence_limit = Duration::from_millis(SILENCE_FINALIZE_MS);
+    let max_samples = (MAX_UTTERANCE_SECS * sample_rate as f32) as usize;
+
+    let mut utterance: Vec<i16> = Vec::new();
+    let mut speaking = false;
+    let mut silence_accum = Duration::ZERO;
+    let mut last_partial_at = Instant::now();
+    let mut last_partial_text = String::new();
+    let mut force_finalize = false;
+
+    let chunk_duration = |len: usize| Duration::from_secs_f32(len as f32 / sample_rate as f32);
+
+    while *running.lock() {
+        // Drain everything currently queued from audio capture.
+        loop {
+            match event_rx.try_recv() {
+                Ok(RealtimeEvent::AudioChunk(samples)) => {
+                    let peak = samples.iter().map(|s| s.saturating_abs()).max().unwrap_or(0);
+                    let is_voice = peak >= VAD_ENERGY_THRESHOLD;
+                    let dur = chunk_duration(samples.len());
+
+                    if is_voice {
+                        if !speaking {
+                            speaking = true;
+                            let _ = transcription_tx.send(TranscriptionEvent::SpeechStarted);
+                        }
+                        silence_accum = Duration::ZERO;
+                        utterance.extend_from_slice(&samples);
+                    } else if speaking {
+                        // Keep trailing silence in the buffer — it helps the
+                        // decoder and marks the end of the utterance.
+                        utterance.extend_from_slice(&samples);
+                        silence_accum += dur;
+                    }
+                    // Silence while not speaking is simply dropped.
+
+                    if utterance.len() > max_samples {
+                        // Force a finalize so the buffer can't grow without bound.
+                        force_finalize = true;
+                    }
+                }
+                Ok(RealtimeEvent::Commit) => force_finalize = true,
+                Ok(RealtimeEvent::Stop) => {
+                    *running.lock() = false;
+                    break;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    *running.lock() = false;
+                    break;
+                }
+            }
+        }
+
+        let should_finalize =
+            speaking && (force_finalize || silence_accum >= silence_limit);
+
+        if should_finalize {
+            if !utterance.is_empty() {
+                match transcribe_buffer(&client, &url, &utterance, sample_rate) {
+                    Ok(text) if !text.trim().is_empty() => {
+                        let _ = transcription_tx.send(TranscriptionEvent::Final(text));
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        let _ = transcription_tx
+                            .send(TranscriptionEvent::Error(e.to_string()));
+                    }
+                }
+            }
+            let _ = transcription_tx.send(TranscriptionEvent::SpeechStopped);
+            utterance.clear();
+            speaking = false;
+            silence_accum = Duration::ZERO;
+            last_partial_text.clear();
+            force_finalize = false;
+        } else if speaking
+            && last_partial_at.elapsed() >= partial_window
+            && !utterance.is_empty()
+        {
+            match transcribe_buffer(&client, &url, &utterance, sample_rate) {
+                Ok(text) if !text.trim().is_empty() && text != last_partial_text => {
+                    last_partial_text = text.clone();
+                    let _ = transcription_tx.send(TranscriptionEvent::Partial(text));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    if config.debug {
+                        eprintln!("[Realtime] partial transcription error: {}", e);
+                    }
+                }
+            }
+            last_partial_at = Instant::now();
+        }
+
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let _ = transcription_tx.send(TranscriptionEvent::Closed);
+    Ok(())
+}
+
+/// Encode i16 mono PCM as an in-memory WAV and POST it to a whisper.cpp
+/// `/inference` endpoint (plain-text response), mirroring the batch backend.
+fn transcribe_buffer(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    samples: &[i16],
+    sample_rate: u32,
+) -> Result<String> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = hound::WavWriter::new(&mut cursor, spec)
+            .context("Failed to create WAV writer")?;
+        for &s in samples {
+            writer.write_sample(s)?;
+        }
+        writer.finalize().context("Failed to finalize WAV")?;
+    }
+    let wav = cursor.into_inner();
+
+    let form = reqwest::blocking::multipart::Form::new()
+        .text("temperature", "0.2")
+        // OpenAI-style underscore param; whisper.cpp ignores the hyphenated form
+        // and returns JSON. We parse defensively below to handle either case.
+        .text("response_format", "text")
+        .part(
+            "file",
+            reqwest::blocking::multipart::Part::bytes(wav)
+                .file_name("audio.wav")
+                .mime_str("audio/wav")?,
+        );
+
+    let response = client.post(url).multipart(form).send()?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_text = response
+            .text()
+            .unwrap_or_else(|_| "Unknown error".to_string());
+        anyhow::bail!("whisper.cpp inference error: {} - {}", status, error_text);
+    }
+
+    let body = response.text()?;
+    Ok(extract_transcript(&body))
+}
+
+/// whisper.cpp's /inference may return plain text or a JSON `{"text": ...}`
+/// envelope depending on the server build and params. Accept either.
+fn extract_transcript(body: &str) -> String {
+    #[derive(Deserialize)]
+    struct Envelope {
+        text: String,
+    }
+    match serde_json::from_str::<Envelope>(body) {
+        Ok(env) => env.text.trim().to_string(),
+        Err(_) => body.trim().to_string(),
+    }
+}
+
 fn build_websocket_url(config: &RealtimeConfig) -> Result<Url> {
     match config.provider {
         RealtimeProvider::OpenAI => {
@@ -446,6 +664,9 @@ fn build_websocket_url(config: &RealtimeConfig) -> Result<Url> {
             }
             Ok(url)
         }
+        RealtimeProvider::WhisperCppLocal => {
+            unreachable!("WhisperCppLocal does not use the WebSocket transport")
+        }
     }
 }
 
@@ -478,6 +699,9 @@ fn build_websocket_request(
         }
         RealtimeProvider::ElevenLabs => {
             request = request.header("xi-api-key", &config.api_key);
+        }
+        RealtimeProvider::WhisperCppLocal => {
+            unreachable!("WhisperCppLocal does not use the WebSocket transport")
         }
     }
 
@@ -535,6 +759,9 @@ fn send_initial_config(
         RealtimeProvider::ElevenLabs => {
             // ElevenLabs doesn't need initial config - it's in the URL params
         }
+        RealtimeProvider::WhisperCppLocal => {
+            unreachable!("WhisperCppLocal does not use the WebSocket transport")
+        }
     }
     Ok(())
 }
@@ -582,6 +809,9 @@ fn send_audio_chunk(
             };
             serde_json::to_string(&chunk)?
         }
+        RealtimeProvider::WhisperCppLocal => {
+            unreachable!("WhisperCppLocal does not use the WebSocket transport")
+        }
     };
 
     socket.send(Message::Text(msg))?;
@@ -604,6 +834,9 @@ fn send_commit(
                 message_type: "commit".to_string(),
             };
             serde_json::to_string(&commit)?
+        }
+        RealtimeProvider::WhisperCppLocal => {
+            unreachable!("WhisperCppLocal does not use the WebSocket transport")
         }
     };
 
@@ -671,6 +904,9 @@ fn parse_transcription_message(config: &RealtimeConfig, text: &str) -> Option<Tr
                 }
                 _ => None,
             }
+        }
+        RealtimeProvider::WhisperCppLocal => {
+            unreachable!("WhisperCppLocal does not use the WebSocket transport")
         }
     }
 }
