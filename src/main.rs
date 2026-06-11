@@ -156,6 +156,28 @@ struct Config {
     #[serde(default = "default_tts_voice")]
     tts_voice: String,
 
+    // Optional style/tone instruction sent as `instruct` (e.g. Qwen3-TTS).
+    // Empty = omitted. Env: TTS_INSTRUCT.
+    #[serde(default)]
+    tts_instruct: String,
+
+    // Stream TTS audio (raw PCM) and play it as it arrives — first sound in
+    // ~0.4s instead of after full generation. Servers without streaming
+    // support fall back to buffered playback automatically.
+    // Env: TTS_STREAM (0/false to disable).
+    #[serde(default = "default_tts_stream")]
+    tts_stream: bool,
+
+    // Optional sampling temperature sent as `temperature` (e.g. Qwen3-TTS;
+    // server default 0.9). Lower = steadier delivery. Env: TTS_TEMPERATURE.
+    #[serde(default)]
+    tts_temperature: Option<f32>,
+
+    // Optional generation seed sent as `seed` for reproducible delivery.
+    // Env: TTS_SEED.
+    #[serde(default)]
+    tts_seed: Option<i64>,
+
     // Assistant mode configuration
     #[serde(default = "default_chat_completion_base_url")]
     chat_completion_base_url: String,
@@ -251,6 +273,10 @@ fn default_tts_voice() -> String {
     "shimmer".to_string() // Default Kokoro voice
 }
 
+fn default_tts_stream() -> bool {
+    true // Stream PCM for low latency; falls back to buffered if unsupported
+}
+
 fn default_chat_completion_api_key() -> String {
     String::new() // Empty by default, set via ANTHROPIC_API_KEY or OPENAI_API_KEY for cloud
 }
@@ -300,6 +326,10 @@ impl Default for Config {
             tts_api_key: default_tts_api_key(),
             tts_model: default_tts_model(),
             tts_voice: default_tts_voice(),
+            tts_instruct: String::new(),
+            tts_stream: default_tts_stream(),
+            tts_temperature: None,
+            tts_seed: None,
         }
     }
 }
@@ -396,6 +426,27 @@ impl Config {
         }
         if let Ok(voice) = std::env::var("TTS_VOICE") {
             config.tts_voice = voice;
+        }
+        if let Ok(instruct) = std::env::var("TTS_INSTRUCT") {
+            config.tts_instruct = instruct;
+        }
+        if let Ok(stream) = std::env::var("TTS_STREAM") {
+            config.tts_stream = !matches!(
+                stream.to_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            );
+        }
+        if let Ok(temperature) = std::env::var("TTS_TEMPERATURE") {
+            match temperature.parse::<f32>() {
+                Ok(t) => config.tts_temperature = Some(t),
+                Err(_) => eprintln!("Ignoring invalid TTS_TEMPERATURE: {temperature}"),
+            }
+        }
+        if let Ok(seed) = std::env::var("TTS_SEED") {
+            match seed.parse::<i64>() {
+                Ok(s) => config.tts_seed = Some(s),
+                Err(_) => eprintln!("Ignoring invalid TTS_SEED: {seed}"),
+            }
         }
 
         Ok(config)
@@ -1772,6 +1823,10 @@ struct TtsSettings {
     openai_api_key: String,
     openai_model: String,
     openai_voice: String,
+    openai_instruct: String,
+    openai_stream: bool,
+    openai_temperature: Option<f32>,
+    openai_seed: Option<i64>,
 }
 
 impl TtsSettings {
@@ -1786,6 +1841,10 @@ impl TtsSettings {
             openai_api_key: config.tts_api_key.clone(),
             openai_model: config.tts_model.clone(),
             openai_voice: config.tts_voice.clone(),
+            openai_instruct: config.tts_instruct.clone(),
+            openai_stream: config.tts_stream,
+            openai_temperature: config.tts_temperature,
+            openai_seed: config.tts_seed,
         }
     }
 }
@@ -1814,7 +1873,11 @@ fn spawn_tts(
                     },
                 )
                 .with_model(tts.openai_model)
-                .with_voice(tts.openai_voice);
+                .with_voice(tts.openai_voice)
+                .with_instruct(Some(tts.openai_instruct))
+                .with_stream(tts.openai_stream)
+                .with_temperature(tts.openai_temperature)
+                .with_seed(tts.openai_seed);
                 if let Err(e) = client.speak_interruptible(&text, Some(interrupt_clone)) {
                     eprintln!("TTS (OpenAI-compatible) Error: {}", e);
                 }
@@ -2521,7 +2584,11 @@ fn main() -> Result<()> {
                     },
                 )
                 .with_model(config.tts_model.clone())
-                .with_voice(config.tts_voice.clone()),
+                .with_voice(config.tts_voice.clone())
+                .with_instruct(Some(config.tts_instruct.clone()))
+                .with_stream(config.tts_stream)
+                .with_temperature(config.tts_temperature)
+                .with_seed(config.tts_seed),
             )
         } else {
             tts_client::TtsClient::ElevenLabs(create_elevenlabs_tts(&config))

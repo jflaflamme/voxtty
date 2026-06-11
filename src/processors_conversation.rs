@@ -19,6 +19,61 @@ const BUILTIN_TOOLS: &[&str] = &["process_command", "speak", "type_text", "switc
 /// Maximum MCP tool call iterations per conversation turn
 const MAX_MCP_ITERATIONS: usize = 5;
 
+/// Parse a tool call that a small model emitted as JSON text in `content`
+/// instead of a structured `tool_calls` array. Accepts the common shapes
+/// `{"name": "...", "arguments": {...}}` / `{"name": "...", "parameters": {...}}`,
+/// with the args either inline JSON or a JSON-encoded string, optionally
+/// wrapped in a markdown code fence.
+fn parse_inline_tool_call(content: &str) -> Option<(String, serde_json::Value)> {
+    let mut text = content.trim();
+    if let Some(stripped) = text.strip_prefix("```") {
+        // Drop an optional language tag (```json) and the closing fence.
+        let stripped = stripped.strip_prefix("json").unwrap_or(stripped);
+        text = stripped.strip_suffix("```").unwrap_or(stripped).trim();
+    }
+
+    // Shape 1: a full JSON object — {"name": "...", "arguments"/"parameters": ...}
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+        if let Some(name) = value.get("name").and_then(|n| n.as_str()) {
+            let args = value
+                .get("arguments")
+                .or_else(|| value.get("parameters"))
+                .cloned()
+                .unwrap_or(json!({}));
+            // Some models double-encode the arguments as a string.
+            let args = match args {
+                serde_json::Value::String(s) => serde_json::from_str(&s).ok()?,
+                other => other,
+            };
+            return Some((name.to_string(), args));
+        }
+    }
+
+    // Shape 2: `speak {"text": "..."}` — bare tool name then JSON args, possibly
+    // prefixed with an emoji or label (e.g. `🗣️ speak {...}`).
+    let brace = text.find('{')?;
+    let (prefix, rest) = text.split_at(brace);
+    // Tool name = last word of the prefix, stripped to identifier chars.
+    let name: String = prefix
+        .split_whitespace()
+        .last()?
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    if name.is_empty() {
+        return None;
+    }
+    // Parse the first JSON value, tolerating trailing text after the object.
+    let args = serde_json::Deserializer::from_str(rest)
+        .into_iter::<serde_json::Value>()
+        .next()?
+        .ok()?;
+    if !args.is_object() {
+        return None;
+    }
+    Some((name, args))
+}
+
 /// Processor that handles bidirectional conversations with clarification
 pub struct ConversationProcessor {
     http_client: Client,
@@ -120,7 +175,10 @@ impl ConversationProcessor {
         // Add current transcription
         messages.push(json!({
             "role": "user",
-            "content": format!("Analyze this request: {}", transcription)
+            // Pass the user's words verbatim. Do NOT wrap in "Analyze this
+            // request:" — small models then narrate an analysis of the request
+            // instead of answering it (and the fallback speaks that aloud).
+            "content": transcription
         }));
 
         // Add tool support - tools depend on mode
@@ -366,6 +424,19 @@ impl ConversationProcessor {
             // Fallback to content
             if let Some(content) = response_json["choices"][0]["message"]["content"].as_str() {
                 eprintln!("[DEBUG] Using content: {}", content);
+
+                // Small models often emit the tool call as JSON text in content
+                // (e.g. {"name":"speak","arguments":{...}}) instead of a structured
+                // tool_calls array. Recover it instead of speaking raw JSON aloud.
+                if let Some((tool_name, tool_args)) = parse_inline_tool_call(content) {
+                    if BUILTIN_TOOLS.contains(&tool_name.as_str()) {
+                        eprintln!(
+                            "[DEBUG] Recovered inline tool call from content: {}",
+                            tool_name
+                        );
+                        return self.handle_builtin_tool(&tool_name, &tool_args, mode);
+                    }
+                }
 
                 // Command mode needs a structured `process_command` tool call; if
                 // the model answered in prose there's no command to run.
