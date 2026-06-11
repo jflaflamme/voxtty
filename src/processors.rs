@@ -21,6 +21,8 @@ pub enum VoiceMode {
     Code { language: Option<String> },
     /// Command mode - execute shell commands
     Command,
+    /// Translation - speak the user's words back in a target language
+    Translate,
 }
 
 /// Trait for audio processors

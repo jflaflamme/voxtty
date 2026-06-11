@@ -62,7 +62,10 @@ impl AudioProcessor for AssistantProcessor {
     fn supports_mode(&self, mode: &VoiceMode) -> bool {
         matches!(
             mode,
-            VoiceMode::Assistant { .. } | VoiceMode::Code { .. } | VoiceMode::Command
+            VoiceMode::Assistant { .. }
+                | VoiceMode::Code { .. }
+                | VoiceMode::Command
+                | VoiceMode::Translate
         )
     }
 
@@ -109,6 +112,7 @@ impl SpeachesAssistantBackend {
         let base = match mode {
             VoiceMode::Code { .. } => self.config.code_system_prompt.clone(),
             VoiceMode::Command => include_str!("../prompts/command.md").to_string(),
+            VoiceMode::Translate => crate::translate_prompt(),
             _ => self.config.system_prompt.clone(),
         };
         // Append user skills dropped in ~/.config/voxtty/skills/*.md (hot-reloaded).

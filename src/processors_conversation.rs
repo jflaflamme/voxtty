@@ -47,6 +47,12 @@ fn parse_inline_tool_call(content: &str) -> Option<(String, serde_json::Value)> 
             };
             return Some((name.to_string(), args));
         }
+        // Shape 1b: bare speak args — {"text": "..."} with no tool name.
+        if let Some(obj) = value.as_object() {
+            if obj.len() == 1 && obj.get("text").map(|t| t.is_string()).unwrap_or(false) {
+                return Some(("speak".to_string(), value));
+            }
+        }
     }
 
     // Shape 2: `speak {"text": "..."}` — bare tool name then JSON args, possibly
@@ -122,6 +128,7 @@ impl ConversationProcessor {
         let mut system_prompt = match mode {
             VoiceMode::Command => include_str!("../prompts/command.md").to_string(),
             VoiceMode::Code { .. } => include_str!("../prompts/code.md").to_string(),
+            VoiceMode::Translate => crate::translate_prompt(),
             _ => include_str!("../prompts/assistant.md").to_string(),
         };
 
@@ -218,10 +225,13 @@ impl ConversationProcessor {
             }));
         }
 
-        // speak tool (Assistant, Command, and Code modes)
+        // speak tool (Assistant, Command, Code, and Translate modes)
         if matches!(
             mode,
-            VoiceMode::Assistant { .. } | VoiceMode::Command | VoiceMode::Code { .. }
+            VoiceMode::Assistant { .. }
+                | VoiceMode::Command
+                | VoiceMode::Code { .. }
+                | VoiceMode::Translate
         ) {
             tools.as_array_mut().unwrap().push(json!({
                 "type": "function",
@@ -271,7 +281,7 @@ impl ConversationProcessor {
                         "properties": {
                             "mode": {
                                 "type": "string",
-                                "enum": ["dictation", "assistant", "code", "command"],
+                                "enum": ["dictation", "assistant", "code", "command", "translate"],
                                 "description": "The mode to switch to"
                             },
                             "confirmation": {
@@ -453,7 +463,10 @@ impl ConversationProcessor {
                 // Assistant/Code modes: small local models often answer in plain
                 // content instead of calling the `speak` tool. Don't discard a
                 // usable answer — speak it directly (🔊 prefix routes it to TTS).
-                if matches!(mode, VoiceMode::Assistant { .. } | VoiceMode::Code { .. }) {
+                if matches!(
+                    mode,
+                    VoiceMode::Assistant { .. } | VoiceMode::Code { .. } | VoiceMode::Translate
+                ) {
                     eprintln!("[WARNING] LLM returned content instead of a tool; speaking it directly");
                     return Ok(LlmAnalysisResponse {
                         needs_clarification: false,
@@ -865,7 +878,10 @@ impl AudioProcessor for ConversationProcessor {
     fn supports_mode(&self, mode: &VoiceMode) -> bool {
         matches!(
             mode,
-            VoiceMode::Assistant { .. } | VoiceMode::Command | VoiceMode::Code { .. }
+            VoiceMode::Assistant { .. }
+                | VoiceMode::Command
+                | VoiceMode::Code { .. }
+                | VoiceMode::Translate
         )
     }
 

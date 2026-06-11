@@ -298,6 +298,13 @@ fn default_code_system_prompt() -> String {
     include_str!("../prompts/code.md").to_string()
 }
 
+/// Translate-mode system prompt with the target language substituted.
+/// Language comes from TRANSLATE_LANGUAGE (default: Khmer).
+pub fn translate_prompt() -> String {
+    let lang = std::env::var("TRANSLATE_LANGUAGE").unwrap_or_else(|_| "Khmer".to_string());
+    include_str!("../prompts/translate.md").replace("{{TARGET_LANGUAGE}}", &lang)
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -737,6 +744,7 @@ impl Tray for VoiceTypingTray {
             VoiceMode::Assistant { .. } => ('A', 33, 150, 243), // Blue
             VoiceMode::Code { .. } => ('C', 156, 39, 176), // Purple
             VoiceMode::Command => ('$', 255, 193, 7),     // Yellow/Gold
+            VoiceMode::Translate => ('T', 0, 188, 212),   // Cyan/Teal
         };
 
         // Override color based on state
@@ -3337,7 +3345,8 @@ fn main() -> Result<()> {
                             let output_text = match mode_snapshot {
                                 VoiceMode::Assistant { .. }
                                 | VoiceMode::Code { .. }
-                                | VoiceMode::Command => {
+                                | VoiceMode::Command
+                                | VoiceMode::Translate => {
                                     // Set processing flag for TUI
                                     if let Some(ref state) = tui_state_clone {
                                         if let Ok(mut s) = state.lock() {
@@ -4097,6 +4106,7 @@ fn main() -> Result<()> {
                             VoiceMode::Assistant { .. }
                                 | VoiceMode::Code { .. }
                                 | VoiceMode::Command
+                                | VoiceMode::Translate
                         ) {
                             if let Some(ref state) = tui_state {
                                 if let Ok(mut s) = state.lock() {
@@ -4198,6 +4208,7 @@ fn main() -> Result<()> {
                                                     }
                                                     "code" => VoiceMode::Code { language: None },
                                                     "command" => VoiceMode::Command,
+                                                    "translate" => VoiceMode::Translate,
                                                     _ => VoiceMode::Dictation,
                                                 };
 
