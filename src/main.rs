@@ -1930,8 +1930,45 @@ fn spawn_tts(
     });
 }
 
+/// Silence alsa-lib's stderr spam (dmix/dsnoop "unable to open slave" probe
+/// errors printed while cpal enumerates PCM devices on PipeWire systems).
+/// Installs a no-op error handler in place of alsa's default printer.
+#[cfg(target_os = "linux")]
+fn silence_alsa_errors() {
+    use std::os::raw::{c_char, c_int};
+    type Handler =
+        unsafe extern "C" fn(*const c_char, c_int, *const c_char, c_int, *const c_char, ...);
+    unsafe extern "C" fn silent(
+        _file: *const c_char,
+        _line: c_int,
+        _function: *const c_char,
+        _err: c_int,
+        _fmt: *const c_char,
+    ) {
+    }
+    extern "C" {
+        // From alsa-lib (already linked via cpal/alsa-sys).
+        fn snd_lib_error_set_handler(handler: Option<Handler>) -> c_int;
+    }
+    unsafe {
+        // The handler ignores every argument, so passing a non-variadic fn
+        // where a variadic one is expected is safe under the C ABI here.
+        let h: Handler = std::mem::transmute(
+            silent
+                as unsafe extern "C" fn(*const c_char, c_int, *const c_char, c_int, *const c_char),
+        );
+        snd_lib_error_set_handler(Some(h));
+    }
+}
+
 fn main() -> Result<()> {
     let mut args = Args::parse();
+
+    // Quiet ALSA's harmless device-probe errors unless debugging audio.
+    #[cfg(target_os = "linux")]
+    if !args.debug {
+        silence_alsa_errors();
+    }
 
     if args.list_devices {
         return list_input_devices();
