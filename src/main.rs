@@ -642,6 +642,12 @@ struct Args {
     #[arg(long, help = "Enable realtime WebSocket streaming (lower latency)")]
     realtime: bool,
 
+    #[arg(
+        long,
+        help = "Start in Translate mode (speaks the TRANSLATE_LANGUAGE translation of your speech)"
+    )]
+    translate: bool,
+
     #[arg(long, help = "Enable system tray icon")]
     tray: bool,
 
@@ -1941,13 +1947,20 @@ fn main() -> Result<()> {
         args.assistant = true;
     }
 
+    // Translate mode needs the LLM pipeline too
+    if args.translate {
+        args.assistant = true;
+    }
+
     // Load config first to validate API keys BEFORE TUI initialization
     let mut config = Config::load()?;
 
     // Initialize core shared state
     let wake_word_detector = WakeWordDetector::new();
-    // Start in Assistant mode if --assistant flag is provided, otherwise Dictation
-    let initial_mode = if args.assistant {
+    // Start in Translate mode if --translate, Assistant if --assistant, else Dictation
+    let initial_mode = if args.translate {
+        VoiceMode::Translate
+    } else if args.assistant {
         VoiceMode::Assistant { context: vec![] }
     } else {
         VoiceMode::Dictation
