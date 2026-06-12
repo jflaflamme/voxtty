@@ -2098,6 +2098,7 @@ fn main() -> Result<()> {
             }
             // Give TUI a moment to clean up, then exit forcefully
             std::thread::sleep(Duration::from_millis(250));
+            let _ = crate::tui::cleanup_terminal();
             std::process::exit(0);
         })
         .expect("Error setting Ctrl-C handler");
@@ -2888,6 +2889,9 @@ fn main() -> Result<()> {
             if let Some(ref state) = tui_state_clone {
                 if let Ok(mut s) = state.lock() {
                     if s.should_exit {
+                        // Restore the terminal before killing the process — the TUI
+                        // thread's own cleanup may not have run yet.
+                        let _ = crate::tui::cleanup_terminal();
                         std::process::exit(0);
                     }
 
@@ -3809,6 +3813,9 @@ fn main() -> Result<()> {
         if let Some(ref state) = tui_state {
             if let Ok(mut s) = state.lock() {
                 if s.should_exit {
+                    // Restore the terminal before killing the process — the TUI
+                    // thread's own cleanup may not have run yet.
+                    let _ = crate::tui::cleanup_terminal();
                     std::process::exit(0);
                 }
 

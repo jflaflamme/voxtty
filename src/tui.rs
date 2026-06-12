@@ -247,6 +247,13 @@ impl TuiApp {
                     state.last_transcription.clear();
                 }
             }
+            KeyCode::Char('5') => {
+                if let Ok(mut state) = self.state.lock() {
+                    state.mode = VoiceMode::Translate;
+                    state.last_input.clear();
+                    state.last_transcription.clear();
+                }
+            }
             KeyCode::Char('p') | KeyCode::Char(' ') => {
                 if let Ok(mut state) = self.state.lock() {
                     state.is_paused = !state.is_paused;
@@ -1042,6 +1049,10 @@ impl TuiApp {
                 Span::styled("  4            ", Style::default().fg(Color::Yellow)),
                 Span::raw("Command mode - execute shell commands"),
             ]),
+            Line::from(vec![
+                Span::styled("  5            ", Style::default().fg(Color::Cyan)),
+                Span::raw("Translate mode - speak the translation aloud"),
+            ]),
             Line::from(""),
             Line::from(Span::styled(
                 "Controls:",
@@ -1136,8 +1147,15 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-/// Helper function to restore the terminal to its original state
-fn cleanup_terminal() -> Result<()> {
+/// Restore the terminal to its original state. Idempotent: runs at most once,
+/// so the TUI thread's guard and main's pre-exit call can't double-restore
+/// (a second LeaveAlternateScreen would print escape codes onto the shell).
+pub fn cleanup_terminal() -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
     disable_raw_mode()?;
     execute!(
         io::stdout(),
