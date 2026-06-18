@@ -19,6 +19,58 @@ const BUILTIN_TOOLS: &[&str] = &["process_command", "speak", "type_text", "switc
 /// Maximum MCP tool call iterations per conversation turn
 const MAX_MCP_ITERATIONS: usize = 5;
 
+/// Strip `<think>...</think>` blocks that reasoning models (Qwen3, LFM2.5
+/// Thinking, DeepSeek-R1) emit inline in `content` — the chain-of-thought must
+/// never reach TTS. An unterminated `<think>` swallows the rest of the string
+/// (the model ran out of tokens mid-thought; there is no answer after it).
+pub fn strip_think_blocks(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut rest = content;
+    while let Some(start) = rest.find("<think>") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("</think>") {
+            Some(end) => rest = &rest[start + end + "</think>".len()..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
+}
+
+#[cfg(test)]
+mod think_tests {
+    use super::strip_think_blocks;
+
+    #[test]
+    fn strips_closed_block() {
+        assert_eq!(
+            strip_think_blocks("<think>reasoning here</think>\n\nសួស្តី"),
+            "សួស្តី"
+        );
+    }
+
+    #[test]
+    fn unterminated_block_swallows_rest() {
+        assert_eq!(strip_think_blocks("<think>ran out of tokens"), "");
+    }
+
+    #[test]
+    fn passes_through_plain_text() {
+        assert_eq!(strip_think_blocks("  Bonjour  "), "Bonjour");
+    }
+
+    #[test]
+    fn strips_multiple_blocks() {
+        assert_eq!(
+            strip_think_blocks("<think>a</think>x<think>b</think>y"),
+            "xy"
+        );
+    }
+}
+
 /// Parse a tool call that a small model emitted as JSON text in `content`
 /// instead of a structured `tool_calls` array. Accepts the common shapes
 /// `{"name": "...", "arguments": {...}}` / `{"name": "...", "parameters": {...}}`,
@@ -118,6 +170,26 @@ impl ConversationProcessor {
         }
     }
 
+    /// POST a chat-completions request, attaching auth only when a key is
+    /// configured. A bare `Authorization: Bearer ` (empty token) makes local
+    /// llama.cpp servers (Lemonade) 500.
+    async fn post_chat(&self, body: &serde_json::Value) -> Result<reqwest::Response> {
+        let mut request = self
+            .http_client
+            .post(format!("{}/chat/completions", self.api_base_url))
+            .header("Content-Type", "application/json")
+            .json(body);
+
+        if !self.api_key.is_empty() {
+            request = request.header("Authorization", format!("Bearer {}", self.api_key));
+        }
+
+        request
+            .send()
+            .await
+            .context("Failed to send analysis request")
+    }
+
     /// Analyze transcription and determine if clarification is needed
     async fn analyze_transcription(
         &self,
@@ -132,20 +204,29 @@ impl ConversationProcessor {
             _ => include_str!("../prompts/assistant.md").to_string(),
         };
 
-        // Inject current date/time so the LLM always knows
-        let now = chrono::Local::now();
-        system_prompt.push_str(&format!(
-            "\n\n## CURRENT CONTEXT\n\n- **Date**: {}\n- **Time**: {}\n",
-            now.format("%A, %B %d, %Y"),
-            now.format("%I:%M %p")
-        ));
+        // Translate mode is a pure transcribe→translate task: the date/time,
+        // user skills, and MCP tool catalog are irrelevant noise. Injecting them
+        // bloats the prompt (~2.4K → ~15K chars with skills) and reliably pushes
+        // small models off-task — e.g. translating into Chinese instead of the
+        // target language. Keep the translate prompt clean.
+        let is_translate = matches!(mode, VoiceMode::Translate);
 
-        // Inject user skills dropped in ~/.config/voxtty/skills/*.md (hot-reloaded).
-        system_prompt.push_str(&crate::skills::skills_prompt_section());
+        if !is_translate {
+            // Inject current date/time so the LLM always knows
+            let now = chrono::Local::now();
+            system_prompt.push_str(&format!(
+                "\n\n## CURRENT CONTEXT\n\n- **Date**: {}\n- **Time**: {}\n",
+                now.format("%A, %B %d, %Y"),
+                now.format("%I:%M %p")
+            ));
+
+            // Inject user skills dropped in ~/.config/voxtty/skills/*.md (hot-reloaded).
+            system_prompt.push_str(&crate::skills::skills_prompt_section());
+        }
 
         // Append MCP tool descriptions dynamically from manager
         let mcp_tools_snapshot = self.get_mcp_tools();
-        if !mcp_tools_snapshot.is_empty() {
+        if !is_translate && !mcp_tools_snapshot.is_empty() {
             system_prompt.push_str("\n\n## EXTERNAL TOOLS (MCP)\n\n");
             system_prompt.push_str(
                 "You also have access to external tools provided by MCP servers. \
@@ -295,10 +376,13 @@ impl ConversationProcessor {
             }));
         }
 
-        // Append MCP tools dynamically from manager
-        let mcp_tools_snapshot = self.get_mcp_tools();
-        for mcp_tool in &mcp_tools_snapshot {
-            tools.as_array_mut().unwrap().push(mcp_tool.clone());
+        // Append MCP tools dynamically from manager. Translate mode is a pure
+        // translation task and must not be tempted to call external tools.
+        if !is_translate {
+            let mcp_tools_snapshot = self.get_mcp_tools();
+            for mcp_tool in &mcp_tools_snapshot {
+                tools.as_array_mut().unwrap().push(mcp_tool.clone());
+            }
         }
 
         // NOTE: We always use "auto" rather than "required". llama.cpp-backed
@@ -314,34 +398,42 @@ impl ConversationProcessor {
             mcp_tools_snapshot.len()
         );
 
+        // Translate mode: ask the server to render the chat template with
+        // thinking disabled (Qwen3-style reasoning models otherwise burn
+        // latency on chain-of-thought before the translation). llama.cpp
+        // servers honor this when started with `--jinja`; servers that reject
+        // the unknown field get one retry without it below.
+        let mut template_kwargs = matches!(mode, VoiceMode::Translate);
+
         // MCP tool call loop: iterate until we get a built-in tool call or content
         for iteration in 0..=MAX_MCP_ITERATIONS {
             let use_tool_choice = if iteration == 0 { tool_choice } else { "auto" };
 
-            let request_body = json!({
+            let mut request_body = json!({
                 "model": self.model,
                 "messages": messages,
                 "temperature": 0.3,
                 "tools": tools,
                 "tool_choice": use_tool_choice
             });
-
-            let mut request = self
-                .http_client
-                .post(format!("{}/chat/completions", self.api_base_url))
-                .header("Content-Type", "application/json")
-                .json(&request_body);
-
-            // Only send auth when a key is configured. A bare `Authorization:
-            // Bearer ` (empty token) makes local llama.cpp servers (Lemonade) 500.
-            if !self.api_key.is_empty() {
-                request = request.header("Authorization", format!("Bearer {}", self.api_key));
+            if template_kwargs {
+                request_body["chat_template_kwargs"] = json!({"enable_thinking": false});
             }
 
-            let response = request
-                .send()
-                .await
-                .context("Failed to send analysis request")?;
+            let mut response = self.post_chat(&request_body).await?;
+
+            if !response.status().is_success() && template_kwargs {
+                eprintln!(
+                    "[DEBUG] Request with chat_template_kwargs failed ({}); retrying without it",
+                    response.status()
+                );
+                template_kwargs = false;
+                request_body
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("chat_template_kwargs");
+                response = self.post_chat(&request_body).await?;
+            }
 
             if !response.status().is_success() {
                 let status = response.status();
@@ -435,6 +527,10 @@ impl ConversationProcessor {
             if let Some(content) = response_json["choices"][0]["message"]["content"].as_str() {
                 eprintln!("[DEBUG] Using content: {}", content);
 
+                // Reasoning models emit chain-of-thought inline; never speak it.
+                let content = strip_think_blocks(content);
+                let content = content.as_str();
+
                 // Small models often emit the tool call as JSON text in content
                 // (e.g. {"name":"speak","arguments":{...}}) instead of a structured
                 // tool_calls array. Recover it instead of speaking raw JSON aloud.
@@ -467,11 +563,21 @@ impl ConversationProcessor {
                     mode,
                     VoiceMode::Assistant { .. } | VoiceMode::Code { .. } | VoiceMode::Translate
                 ) {
+                    if content.is_empty() {
+                        // The model spent its whole reply on chain-of-thought.
+                        eprintln!("[WARNING] LLM content was only <think> blocks; nothing to speak");
+                        return Ok(LlmAnalysisResponse {
+                            needs_clarification: false,
+                            clarification_question: None,
+                            response: Some("🔊 I had trouble with that. Please try again.".to_string()),
+                            confidence: 0.0,
+                        });
+                    }
                     eprintln!("[WARNING] LLM returned content instead of a tool; speaking it directly");
                     return Ok(LlmAnalysisResponse {
                         needs_clarification: false,
                         clarification_question: None,
-                        response: Some(format!("🔊 {}", content.trim())),
+                        response: Some(format!("🔊 {}", content)),
                         confidence: 0.8,
                     });
                 }

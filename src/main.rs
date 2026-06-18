@@ -298,10 +298,28 @@ fn default_code_system_prompt() -> String {
     include_str!("../prompts/code.md").to_string()
 }
 
+/// Map a common demonym or informal language name to the canonical glottonym
+/// the LLM knows best. Small models confuse a demonym like "Cambodian" with a
+/// neighboring language (it drifts to Lao); the glottonym "Khmer" is rock
+/// solid. Unknown names pass through unchanged.
+fn canonical_language_name(input: &str) -> String {
+    match input.trim().to_lowercase().as_str() {
+        "cambodian" => "Khmer",
+        "filipino" => "Tagalog",
+        "farsi" => "Persian",
+        "castilian" => "Spanish",
+        "mandarin" | "mandarin chinese" => "Chinese",
+        "burmese" => "Burmese",
+        _ => return input.trim().to_string(),
+    }
+    .to_string()
+}
+
 /// Translate-mode system prompt with the target language substituted.
 /// Language comes from TRANSLATE_LANGUAGE (default: Khmer).
 pub fn translate_prompt() -> String {
-    let lang = std::env::var("TRANSLATE_LANGUAGE").unwrap_or_else(|_| "Khmer".to_string());
+    let raw = std::env::var("TRANSLATE_LANGUAGE").unwrap_or_else(|_| "Khmer".to_string());
+    let lang = canonical_language_name(&raw);
     include_str!("../prompts/translate.md").replace("{{TARGET_LANGUAGE}}", &lang)
 }
 
@@ -3756,8 +3774,7 @@ fn main() -> Result<()> {
                                 drop(played);
 
                                 // Speak startup confirmation via the configured TTS backend
-                                let startup_message =
-                                    "Bidirectional mode activated. I'm ready to assist you.";
+                                let startup_message = "Hey, I am ready to assist you.";
 
                                 if tui_state_clone.is_none() {
                                     println!("🔊 Speaking startup message...");
@@ -3835,7 +3852,7 @@ fn main() -> Result<()> {
     // confirmation the assistant is ready — the realtime path does this on connect.
     if args.bidirectional && !args.start_paused {
         spawn_tts(
-            "Bidirectional mode activated. I'm ready to assist you.".to_string(),
+            "Hey, I am ready to assist you.".to_string(),
             TtsSettings::from_config(&config),
             tts_interrupt.clone(),
             is_tts_speaking.clone(),
