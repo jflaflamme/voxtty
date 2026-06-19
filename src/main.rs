@@ -193,6 +193,36 @@ struct Config {
 
     #[serde(default = "default_code_system_prompt")]
     code_system_prompt: String,
+
+    // Optional per-mode LLM model overrides. Each falls back to `llm_model` when
+    // unset. Lets e.g. a Khmer-tuned model handle Translate while a stronger
+    // tool-caller handles Command. Env: TRANSLATE_LLM_MODEL, COMMAND_LLM_MODEL,
+    // CODE_LLM_MODEL, ASSISTANT_LLM_MODEL. Note: switching modes reloads the
+    // model on single-slot servers (e.g. Lemonade), so the first turn pays load.
+    #[serde(default)]
+    translate_llm_model: Option<String>,
+    #[serde(default)]
+    command_llm_model: Option<String>,
+    #[serde(default)]
+    code_llm_model: Option<String>,
+    #[serde(default)]
+    assistant_llm_model: Option<String>,
+
+    // Optional separate TTS backend for Translate mode (target-language voice).
+    // When `translate_tts_backend` is set, Translate-mode speech uses these
+    // settings; every other mode uses the main tts_* settings (English voice).
+    // Unset fields fall back to the corresponding main tts_* value.
+    // Env: TRANSLATE_TTS_BACKEND/BASE_URL/MODEL/VOICE/API_KEY.
+    #[serde(default)]
+    translate_tts_backend: Option<String>,
+    #[serde(default)]
+    translate_tts_base_url: Option<String>,
+    #[serde(default)]
+    translate_tts_model: Option<String>,
+    #[serde(default)]
+    translate_tts_voice: Option<String>,
+    #[serde(default)]
+    translate_tts_api_key: Option<String>,
 }
 
 fn default_ydotool_socket() -> String {
@@ -355,6 +385,15 @@ impl Default for Config {
             tts_stream: default_tts_stream(),
             tts_temperature: None,
             tts_seed: None,
+            translate_llm_model: None,
+            command_llm_model: None,
+            code_llm_model: None,
+            assistant_llm_model: None,
+            translate_tts_backend: None,
+            translate_tts_base_url: None,
+            translate_tts_model: None,
+            translate_tts_voice: None,
+            translate_tts_api_key: None,
         }
     }
 }
@@ -429,6 +468,17 @@ impl Config {
         if let Ok(model) = std::env::var("LLM_MODEL") {
             config.llm_model = model;
         }
+        // Per-mode LLM overrides (optional; empty string clears the override).
+        for (var, slot) in [
+            ("TRANSLATE_LLM_MODEL", &mut config.translate_llm_model),
+            ("COMMAND_LLM_MODEL", &mut config.command_llm_model),
+            ("CODE_LLM_MODEL", &mut config.code_llm_model),
+            ("ASSISTANT_LLM_MODEL", &mut config.assistant_llm_model),
+        ] {
+            if let Ok(m) = std::env::var(var) {
+                *slot = if m.trim().is_empty() { None } else { Some(m) };
+            }
+        }
         if let Ok(prompt) = std::env::var("SYSTEM_PROMPT") {
             config.system_prompt = prompt;
         }
@@ -451,6 +501,23 @@ impl Config {
         }
         if let Ok(voice) = std::env::var("TTS_VOICE") {
             config.tts_voice = voice;
+        }
+        // Separate Translate-mode TTS backend (target-language voice). Setting
+        // TRANSLATE_TTS_BACKEND activates per-mode TTS routing.
+        if let Ok(v) = std::env::var("TRANSLATE_TTS_BACKEND") {
+            config.translate_tts_backend = if v.trim().is_empty() { None } else { Some(v) };
+        }
+        if let Ok(v) = std::env::var("TRANSLATE_TTS_BASE_URL") {
+            config.translate_tts_base_url = Some(v);
+        }
+        if let Ok(v) = std::env::var("TRANSLATE_TTS_MODEL") {
+            config.translate_tts_model = Some(v);
+        }
+        if let Ok(v) = std::env::var("TRANSLATE_TTS_VOICE") {
+            config.translate_tts_voice = Some(v);
+        }
+        if let Ok(v) = std::env::var("TRANSLATE_TTS_API_KEY") {
+            config.translate_tts_api_key = Some(v);
         }
         if let Ok(instruct) = std::env::var("TTS_INSTRUCT") {
             config.tts_instruct = instruct;
@@ -1843,6 +1910,54 @@ fn create_elevenlabs_tts(config: &Config) -> elevenlabs_tts::ElevenLabsTts {
     tts
 }
 
+/// Build the optional Translate-mode TTS client (target-language voice). Returns
+/// None unless `translate_tts_backend` is set. Unset fields fall back to the
+/// main tts_* settings.
+fn build_translate_tts(config: &Config) -> Option<tts_client::TtsClient> {
+    let backend = config.translate_tts_backend.as_ref()?;
+    let base_url = config
+        .translate_tts_base_url
+        .clone()
+        .unwrap_or_else(|| config.tts_base_url.clone());
+    let model = config
+        .translate_tts_model
+        .clone()
+        .unwrap_or_else(|| config.tts_model.clone());
+    let voice = config
+        .translate_tts_voice
+        .clone()
+        .unwrap_or_else(|| config.tts_voice.clone());
+    let api_key = config
+        .translate_tts_api_key
+        .clone()
+        .unwrap_or_else(|| config.tts_api_key.clone());
+
+    if backend.to_lowercase() == "openai" {
+        Some(tts_client::TtsClient::OpenAi(
+            openai_tts::OpenAiTts::new(
+                base_url,
+                if api_key.is_empty() { None } else { Some(api_key) },
+            )
+            .with_model(model)
+            .with_voice(voice)
+            .with_instruct(Some(config.tts_instruct.clone()))
+            .with_stream(config.tts_stream)
+            .with_temperature(config.tts_temperature)
+            .with_seed(config.tts_seed),
+        ))
+    } else {
+        // ElevenLabs target voice: reuse the account key, override the voice id.
+        let key = if api_key.is_empty() {
+            config.elevenlabs_api_key.clone()
+        } else {
+            api_key
+        };
+        Some(tts_client::TtsClient::ElevenLabs(
+            elevenlabs_tts::ElevenLabsTts::new(key, voice),
+        ))
+    }
+}
+
 /// Bundle of TTS settings captured from Config, cloneable into the playback thread.
 #[derive(Clone)]
 struct TtsSettings {
@@ -2679,6 +2794,24 @@ fn main() -> Result<()> {
             is_tts_speaking.clone(),
             tts_interrupt.clone(),
         );
+
+        conversation_processor.set_debug(args.debug);
+
+        // Optional per-mode LLM model overrides (e.g. Khmer model for Translate,
+        // stronger tool-caller for Command).
+        conversation_processor.set_mode_models(
+            crate::processors_conversation::ModeModels {
+                translate: config.translate_llm_model.clone(),
+                command: config.command_llm_model.clone(),
+                code: config.code_llm_model.clone(),
+                assistant: config.assistant_llm_model.clone(),
+            },
+        );
+
+        // Optional separate Translate-mode TTS (target-language voice).
+        if let Some(translate_tts) = build_translate_tts(&config) {
+            conversation_processor.set_translate_tts(Arc::new(translate_tts));
+        }
 
         // Inject transcription function
         let config_clone = config.clone();

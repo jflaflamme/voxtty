@@ -132,18 +132,42 @@ fn parse_inline_tool_call(content: &str) -> Option<(String, serde_json::Value)> 
     Some((name, args))
 }
 
+/// Gated debug logging — only prints when the processor's debug flag is on.
+macro_rules! dbg_log {
+    ($self:ident, $($arg:tt)*) => {
+        if $self.debug { eprintln!($($arg)*); }
+    };
+}
+
+/// Optional per-mode LLM model overrides; each falls back to the default model.
+#[derive(Default, Clone)]
+pub struct ModeModels {
+    pub translate: Option<String>,
+    pub command: Option<String>,
+    pub code: Option<String>,
+    pub assistant: Option<String>,
+}
+
 /// Processor that handles bidirectional conversations with clarification
 pub struct ConversationProcessor {
     http_client: Client,
     api_base_url: String,
     api_key: String,
     model: String,
+    mode_models: ModeModels,
     context: Arc<Mutex<ConversationContext>>,
     tts_client: Option<Arc<TtsClient>>,
+    /// Separate TTS client used only for Translate mode (target-language voice).
+    translate_tts_client: Option<Arc<TtsClient>>,
+    /// Last mode seen, so we can clear history when the mode changes (otherwise
+    /// e.g. Khmer translate turns bleed into the next assistant reply).
+    last_mode: Mutex<Option<VoiceMode>>,
     transcription_fn: Option<TranscriptionFn>,
     is_tts_speaking: Arc<Mutex<bool>>,
     tts_interrupt: Arc<AtomicBool>,
     mcp_manager: Option<Arc<Mutex<McpManager>>>,
+    /// Gate for verbose [DEBUG] logging (off unless --debug).
+    debug: bool,
 }
 
 impl ConversationProcessor {
@@ -161,13 +185,70 @@ impl ConversationProcessor {
             api_base_url,
             api_key,
             model,
+            mode_models: ModeModels::default(),
             context: Arc::new(Mutex::new(ConversationContext::new())),
             tts_client: Some(tts_client),
+            translate_tts_client: None,
+            last_mode: Mutex::new(None),
             transcription_fn: None,
             is_tts_speaking,
             tts_interrupt,
             mcp_manager: None,
+            debug: false,
         }
+    }
+
+    /// Enable verbose [DEBUG] logging (wired from --debug).
+    pub fn set_debug(&mut self, debug: bool) {
+        self.debug = debug;
+    }
+
+    /// Set optional per-mode model overrides.
+    pub fn set_mode_models(&mut self, models: ModeModels) {
+        self.mode_models = models;
+    }
+
+    /// Set the separate TTS client used for Translate-mode (target language).
+    pub fn set_translate_tts(&mut self, client: Arc<TtsClient>) {
+        self.translate_tts_client = Some(client);
+    }
+
+    /// Resolve the model to use for a given mode (override or default).
+    fn model_for(&self, mode: &VoiceMode) -> String {
+        let over = match mode {
+            VoiceMode::Translate => &self.mode_models.translate,
+            VoiceMode::Command => &self.mode_models.command,
+            VoiceMode::Code { .. } => &self.mode_models.code,
+            VoiceMode::Assistant { .. } => &self.mode_models.assistant,
+            _ => &None,
+        };
+        over.clone().unwrap_or_else(|| self.model.clone())
+    }
+
+    /// Pick the TTS client for a mode: the target-language client for Translate
+    /// (when configured), otherwise the main (English) client.
+    fn tts_for(&self, mode: &VoiceMode) -> Option<&Arc<TtsClient>> {
+        if matches!(mode, VoiceMode::Translate) {
+            if let Some(t) = &self.translate_tts_client {
+                return Some(t);
+            }
+        }
+        self.tts_client.as_ref()
+    }
+
+    /// Clear conversation history when the mode changes, so prior-mode turns
+    /// (e.g. Khmer translations) don't bleed into the new mode's replies.
+    fn reset_on_mode_change(&self, mode: &VoiceMode) {
+        let mut last = self.last_mode.lock().unwrap();
+        // Compare by variant only — Assistant{context}/Code{language} carry inner
+        // data that varies between turns within the same logical mode.
+        let changed = matches!(last.as_ref(), Some(prev)
+            if std::mem::discriminant(prev) != std::mem::discriminant(mode));
+        if changed {
+            dbg_log!(self, "[DEBUG] Mode changed; clearing conversation history");
+            self.context.lock().unwrap().reset();
+        }
+        *last = Some(mode.clone());
     }
 
     /// POST a chat-completions request, attaching auth only when a key is
@@ -392,8 +473,7 @@ impl ConversationProcessor {
         // TODO(tool-choice): make this provider-configurable; cloud OpenAI supports "required".
         let tool_choice = "auto";
 
-        eprintln!(
-            "[DEBUG] Total tools for LLM: {} (including {} MCP tools)",
+        dbg_log!(self, "[DEBUG] Total tools for LLM: {} (including {} MCP tools)",
             tools.as_array().map(|a| a.len()).unwrap_or(0),
             mcp_tools_snapshot.len()
         );
@@ -405,12 +485,18 @@ impl ConversationProcessor {
         // the unknown field get one retry without it below.
         let mut template_kwargs = matches!(mode, VoiceMode::Translate);
 
+        // Resolve the model for this mode (per-mode override or default).
+        let model = self.model_for(mode);
+        if model != self.model {
+            dbg_log!(self, "[DEBUG] Using per-mode model for {:?}: {}", mode, model);
+        }
+
         // MCP tool call loop: iterate until we get a built-in tool call or content
         for iteration in 0..=MAX_MCP_ITERATIONS {
             let use_tool_choice = if iteration == 0 { tool_choice } else { "auto" };
 
             let mut request_body = json!({
-                "model": self.model,
+                "model": model,
                 "messages": messages,
                 "temperature": 0.3,
                 "tools": tools,
@@ -423,8 +509,7 @@ impl ConversationProcessor {
             let mut response = self.post_chat(&request_body).await?;
 
             if !response.status().is_success() && template_kwargs {
-                eprintln!(
-                    "[DEBUG] Request with chat_template_kwargs failed ({}); retrying without it",
+                dbg_log!(self, "[DEBUG] Request with chat_template_kwargs failed ({}); retrying without it",
                     response.status()
                 );
                 template_kwargs = false;
@@ -443,8 +528,7 @@ impl ConversationProcessor {
 
             let response_json: serde_json::Value = response.json().await?;
 
-            eprintln!(
-                "[DEBUG] LLM Response (iteration {}): {}",
+            dbg_log!(self, "[DEBUG] LLM Response (iteration {}): {}",
                 iteration,
                 serde_json::to_string_pretty(&response_json).unwrap_or_default()
             );
@@ -453,14 +537,14 @@ impl ConversationProcessor {
             if let Some(tool_calls_arr) =
                 response_json["choices"][0]["message"]["tool_calls"].as_array()
             {
-                eprintln!("[DEBUG] Found {} tool calls", tool_calls_arr.len());
+                dbg_log!(self, "[DEBUG] Found {} tool calls", tool_calls_arr.len());
                 if let Some(tool_call) = tool_calls_arr.first() {
                     if let Some(tool_name) = tool_call["function"]["name"].as_str() {
                         let tool_id = tool_call["id"].as_str().unwrap_or("call_0");
-                        eprintln!("[DEBUG] Tool name: {}", tool_name);
+                        dbg_log!(self, "[DEBUG] Tool name: {}", tool_name);
 
                         if let Some(args_str) = tool_call["function"]["arguments"].as_str() {
-                            eprintln!("[DEBUG] Tool args: {}", args_str);
+                            dbg_log!(self, "[DEBUG] Tool args: {}", args_str);
                             let args: serde_json::Value =
                                 serde_json::from_str(args_str).unwrap_or(json!({}));
 
@@ -472,8 +556,7 @@ impl ConversationProcessor {
                             // Handle MCP tools
                             if let Some(ref mcp_mgr) = self.mcp_manager {
                                 if iteration >= MAX_MCP_ITERATIONS {
-                                    eprintln!(
-                                        "[DEBUG] Max MCP iterations ({}) reached",
+                                    dbg_log!(self, "[DEBUG] Max MCP iterations ({}) reached",
                                         MAX_MCP_ITERATIONS
                                     );
                                     break;
@@ -487,8 +570,7 @@ impl ConversationProcessor {
                                         }
                                     };
 
-                                eprintln!(
-                                    "[DEBUG] MCP tool '{}' result: {}",
+                                dbg_log!(self, "[DEBUG] MCP tool '{}' result: {}",
                                     tool_name,
                                     &tool_result[..tool_result.len().min(200)]
                                 );
@@ -520,12 +602,12 @@ impl ConversationProcessor {
                     }
                 }
             } else {
-                eprintln!("[DEBUG] No tool calls found in response");
+                dbg_log!(self, "[DEBUG] No tool calls found in response");
             }
 
             // Fallback to content
             if let Some(content) = response_json["choices"][0]["message"]["content"].as_str() {
-                eprintln!("[DEBUG] Using content: {}", content);
+                dbg_log!(self, "[DEBUG] Using content: {}", content);
 
                 // Reasoning models emit chain-of-thought inline; never speak it.
                 let content = strip_think_blocks(content);
@@ -536,8 +618,7 @@ impl ConversationProcessor {
                 // tool_calls array. Recover it instead of speaking raw JSON aloud.
                 if let Some((tool_name, tool_args)) = parse_inline_tool_call(content) {
                     if BUILTIN_TOOLS.contains(&tool_name.as_str()) {
-                        eprintln!(
-                            "[DEBUG] Recovered inline tool call from content: {}",
+                        dbg_log!(self, "[DEBUG] Recovered inline tool call from content: {}",
                             tool_name
                         );
                         return self.handle_builtin_tool(&tool_name, &tool_args, mode);
@@ -590,7 +671,7 @@ impl ConversationProcessor {
                 });
             }
 
-            eprintln!("[DEBUG] No content or tool call found!");
+            dbg_log!(self, "[DEBUG] No content or tool call found!");
             anyhow::bail!("No content or tool call in LLM response");
         }
 
@@ -615,7 +696,7 @@ impl ConversationProcessor {
         match tool_name {
             "process_command" => {
                 if let Some(command) = args["command"].as_str() {
-                    eprintln!("[DEBUG] Extracted command: {}", command);
+                    dbg_log!(self, "[DEBUG] Extracted command: {}", command);
                     Ok(LlmAnalysisResponse {
                         needs_clarification: false,
                         clarification_question: None,
@@ -633,7 +714,7 @@ impl ConversationProcessor {
             }
             "speak" => {
                 if let Some(speak_text) = args["text"].as_str() {
-                    eprintln!("[DEBUG] Extracted speak text: {}", speak_text);
+                    dbg_log!(self, "[DEBUG] Extracted speak text: {}", speak_text);
                     Ok(LlmAnalysisResponse {
                         needs_clarification: false,
                         clarification_question: None,
@@ -651,7 +732,7 @@ impl ConversationProcessor {
             }
             "type_text" => {
                 if let Some(type_text) = args["text"].as_str() {
-                    eprintln!("[DEBUG] Extracted type text: {}", type_text);
+                    dbg_log!(self, "[DEBUG] Extracted type text: {}", type_text);
                     Ok(LlmAnalysisResponse {
                         needs_clarification: false,
                         clarification_question: None,
@@ -671,8 +752,7 @@ impl ConversationProcessor {
                 if let (Some(mode_str), Some(confirmation)) =
                     (args["mode"].as_str(), args["confirmation"].as_str())
                 {
-                    eprintln!(
-                        "[DEBUG] Mode switch request: {} with confirmation: {}",
+                    dbg_log!(self, "[DEBUG] Mode switch request: {} with confirmation: {}",
                         mode_str, confirmation
                     );
                     Ok(LlmAnalysisResponse {
@@ -714,17 +794,18 @@ impl ConversationProcessor {
 
             // Spawn TTS in background thread to prevent blocking
             *is_speaking_clone.lock().unwrap() = true;
-            eprintln!("[DEBUG] Set is_tts_speaking = true (clarification)");
+            dbg_log!(self, "[DEBUG] Set is_tts_speaking = true (clarification)");
             let interrupt_clone = Arc::clone(&self.tts_interrupt);
+            let debug = self.debug;
             std::thread::spawn(move || {
-                eprintln!("[DEBUG TTS Thread] Starting clarification TTS playback");
+                if debug { eprintln!("[DEBUG TTS Thread] Starting clarification TTS playback"); }
                 if let Err(e) =
                     tts_clone.speak_blocking(&question_owned, Some(interrupt_clone))
                 {
                     eprintln!("❌ TTS Error: {}", e);
                 }
                 *is_speaking_clone.lock().unwrap() = false;
-                eprintln!("[DEBUG TTS Thread] Set is_tts_speaking = false (clarification)");
+                if debug { eprintln!("[DEBUG TTS Thread] Set is_tts_speaking = false (clarification)"); }
                 eprintln!("✅ Question spoken, waiting for your response...");
             });
         } else {
@@ -747,13 +828,12 @@ impl AudioProcessor for ConversationProcessor {
             anyhow::bail!("No transcription function configured");
         };
 
-        eprintln!(
-            "[DEBUG ConversationProcessor] Transcription: {}",
+        dbg_log!(self, "[DEBUG ConversationProcessor] Transcription: {}",
             transcription
         );
 
         if transcription.trim().is_empty() {
-            eprintln!("[DEBUG ConversationProcessor] Empty transcription, returning");
+            dbg_log!(self, "[DEBUG ConversationProcessor] Empty transcription, returning");
             return Ok(String::new());
         }
 
@@ -794,12 +874,11 @@ impl AudioProcessor for ConversationProcessor {
                     let ctx_snapshot = self.context.lock().unwrap().clone();
 
                     // Analyze if we need clarification (no lock held during await)
-                    eprintln!("[DEBUG ConversationProcessor] Calling analyze_transcription");
+                    dbg_log!(self, "[DEBUG ConversationProcessor] Calling analyze_transcription");
                     let analysis = self
                         .analyze_transcription(&transcription, &ctx_snapshot, mode)
                         .await?;
-                    eprintln!(
-                        "[DEBUG ConversationProcessor] Analysis complete: needs_clarification={}",
+                    dbg_log!(self, "[DEBUG ConversationProcessor] Analysis complete: needs_clarification={}",
                         analysis.needs_clarification
                     );
 
@@ -853,15 +932,16 @@ impl AudioProcessor for ConversationProcessor {
 
                                     // Spawn TTS in background thread
                                     *is_speaking_clone.lock().unwrap() = true;
-                                    eprintln!("[DEBUG] Set is_tts_speaking = true");
+                                    dbg_log!(self, "[DEBUG] Set is_tts_speaking = true");
                                     let interrupt_clone = Arc::clone(&self.tts_interrupt);
+                                    let debug = self.debug;
                                     std::thread::spawn(move || {
-                                        eprintln!("[DEBUG TTS Thread] Starting TTS playback");
+                                        if debug { eprintln!("[DEBUG TTS Thread] Starting TTS playback"); }
                                         if let Err(e) = tts_clone.speak_blocking(&speak_text_owned, Some(interrupt_clone)) {
                                             eprintln!("❌ TTS Error: {}", e);
                                         }
                                         *is_speaking_clone.lock().unwrap() = false;
-                                        eprintln!("[DEBUG TTS Thread] Set is_tts_speaking = false");
+                                        if debug { eprintln!("[DEBUG TTS Thread] Set is_tts_speaking = false"); }
                                         eprintln!("✅ Answer spoken");
                                     });
                                 }
@@ -940,15 +1020,16 @@ impl AudioProcessor for ConversationProcessor {
 
                                     // Spawn TTS in background thread
                                     *is_speaking_clone.lock().unwrap() = true;
-                                    eprintln!("[DEBUG] Set is_tts_speaking = true");
+                                    dbg_log!(self, "[DEBUG] Set is_tts_speaking = true");
                                     let interrupt_clone = Arc::clone(&self.tts_interrupt);
+                                    let debug = self.debug;
                                     std::thread::spawn(move || {
-                                        eprintln!("[DEBUG TTS Thread] Starting TTS playback");
+                                        if debug { eprintln!("[DEBUG TTS Thread] Starting TTS playback"); }
                                         if let Err(e) = tts_clone.speak_blocking(&speak_text_owned, Some(interrupt_clone)) {
                                             eprintln!("❌ TTS Error: {}", e);
                                         }
                                         *is_speaking_clone.lock().unwrap() = false;
-                                        eprintln!("[DEBUG TTS Thread] Set is_tts_speaking = false");
+                                        if debug { eprintln!("[DEBUG TTS Thread] Set is_tts_speaking = false"); }
                                         eprintln!("✅ Answer spoken");
                                     });
                                 }
@@ -1034,14 +1115,17 @@ impl ConversationProcessor {
 
     /// Process text directly (for realtime mode)
     pub fn process_text(&self, text: &str, mode: &VoiceMode, _debug: bool) -> Result<String> {
-        eprintln!(
-            "[DEBUG ConversationProcessor::process_text] Input: {}",
+        dbg_log!(self, "[DEBUG ConversationProcessor::process_text] Input: {}",
             text
         );
 
         if text.trim().is_empty() {
             return Ok(String::new());
         }
+
+        // Clear history if the mode changed since the last turn (before we add
+        // this turn), so prior-mode language/context doesn't bleed over.
+        self.reset_on_mode_change(mode);
 
         // Use tokio runtime for async operations
         let rt = tokio::runtime::Runtime::new()?;
@@ -1101,8 +1185,9 @@ impl ConversationProcessor {
                     if response.starts_with("🔊 ") {
                         let speak_text = response.trim_start_matches("🔊 ").trim();
 
-                        // Speak via TTS in background
-                        if let Some(tts) = &self.tts_client {
+                        // Speak via TTS in background, routing Translate mode to
+                        // the target-language client when configured.
+                        if let Some(tts) = self.tts_for(mode) {
                             eprintln!("🔊 Speaking final answer...");
                             let tts_clone = Arc::clone(tts);
                             let speak_text_owned = speak_text.to_string();
@@ -1110,19 +1195,18 @@ impl ConversationProcessor {
 
                             // Spawn TTS in background thread
                             *is_speaking_clone.lock().unwrap() = true;
-                            eprintln!("[DEBUG process_text] Set is_tts_speaking = true");
+                            dbg_log!(self, "[DEBUG process_text] Set is_tts_speaking = true");
                             let interrupt_clone = Arc::clone(&self.tts_interrupt);
+                            let debug = self.debug;
                             std::thread::spawn(move || {
-                                eprintln!("[DEBUG process_text Thread] Starting TTS playback");
+                                if debug { eprintln!("[DEBUG process_text Thread] Starting TTS playback"); }
                                 if let Err(e) = tts_clone
                                     .speak_blocking(&speak_text_owned, Some(interrupt_clone))
                                 {
                                     eprintln!("❌ TTS Error: {}", e);
                                 }
                                 *is_speaking_clone.lock().unwrap() = false;
-                                eprintln!(
-                                    "[DEBUG process_text Thread] Set is_tts_speaking = false"
-                                );
+                                if debug { eprintln!("[DEBUG process_text Thread] Set is_tts_speaking = false"); }
                                 eprintln!("✅ Answer spoken");
                             });
                         }
