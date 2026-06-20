@@ -46,6 +46,7 @@ mod processors;
 mod processors_assistant;
 mod processors_conversation;
 mod processors_transcription;
+mod screen_capture;
 mod realtime;
 mod sounds;
 mod tui;
@@ -194,6 +195,11 @@ struct Config {
     #[serde(default = "default_code_system_prompt")]
     code_system_prompt: String,
 
+    // Optional name the assistant calls itself in Assistant mode.
+    // Env: ASSISTANT_NAME.
+    #[serde(default)]
+    assistant_name: Option<String>,
+
     // Optional per-mode LLM model overrides. Each falls back to `llm_model` when
     // unset. Lets e.g. a Khmer-tuned model handle Translate while a stronger
     // tool-caller handles Command. Env: TRANSLATE_LLM_MODEL, COMMAND_LLM_MODEL,
@@ -207,6 +213,10 @@ struct Config {
     code_llm_model: Option<String>,
     #[serde(default)]
     assistant_llm_model: Option<String>,
+    // Model for Screen mode (must be vision-capable for screenshots; also handles
+    // terminal-text turns). Env: VISION_LLM_MODEL. Falls back to llm_model.
+    #[serde(default)]
+    vision_llm_model: Option<String>,
 
     // Optional separate TTS backend for Translate mode (target-language voice).
     // When `translate_tts_backend` is set, Translate-mode speech uses these
@@ -223,6 +233,10 @@ struct Config {
     translate_tts_voice: Option<String>,
     #[serde(default)]
     translate_tts_api_key: Option<String>,
+    // Per-translate streaming override. Unset = inherit TTS_STREAM.
+    // Env: TRANSLATE_TTS_STREAM (0/false to disable for the Khmer voice only).
+    #[serde(default)]
+    translate_tts_stream: Option<bool>,
 }
 
 fn default_ydotool_socket() -> String {
@@ -389,11 +403,14 @@ impl Default for Config {
             command_llm_model: None,
             code_llm_model: None,
             assistant_llm_model: None,
+            vision_llm_model: None,
             translate_tts_backend: None,
             translate_tts_base_url: None,
             translate_tts_model: None,
             translate_tts_voice: None,
             translate_tts_api_key: None,
+            translate_tts_stream: None,
+            assistant_name: None,
         }
     }
 }
@@ -474,6 +491,7 @@ impl Config {
             ("COMMAND_LLM_MODEL", &mut config.command_llm_model),
             ("CODE_LLM_MODEL", &mut config.code_llm_model),
             ("ASSISTANT_LLM_MODEL", &mut config.assistant_llm_model),
+            ("VISION_LLM_MODEL", &mut config.vision_llm_model),
         ] {
             if let Ok(m) = std::env::var(var) {
                 *slot = if m.trim().is_empty() { None } else { Some(m) };
@@ -481,6 +499,9 @@ impl Config {
         }
         if let Ok(prompt) = std::env::var("SYSTEM_PROMPT") {
             config.system_prompt = prompt;
+        }
+        if let Ok(name) = std::env::var("ASSISTANT_NAME") {
+            config.assistant_name = if name.trim().is_empty() { None } else { Some(name) };
         }
         if let Ok(prompt) = std::env::var("CODE_SYSTEM_PROMPT") {
             config.code_system_prompt = prompt;
@@ -518,6 +539,10 @@ impl Config {
         }
         if let Ok(v) = std::env::var("TRANSLATE_TTS_API_KEY") {
             config.translate_tts_api_key = Some(v);
+        }
+        if let Ok(v) = std::env::var("TRANSLATE_TTS_STREAM") {
+            config.translate_tts_stream =
+                Some(!matches!(v.to_lowercase().as_str(), "0" | "false" | "no" | "off"));
         }
         if let Ok(instruct) = std::env::var("TTS_INSTRUCT") {
             config.tts_instruct = instruct;
@@ -836,6 +861,7 @@ impl Tray for VoiceTypingTray {
             VoiceMode::Code { .. } => ('C', 156, 39, 176), // Purple
             VoiceMode::Command => ('$', 255, 193, 7),     // Yellow/Gold
             VoiceMode::Translate => ('T', 0, 188, 212),   // Cyan/Teal
+            VoiceMode::Screen => ('S', 255, 112, 67),     // Deep orange
         };
 
         // Override color based on state
@@ -1910,11 +1936,23 @@ fn create_elevenlabs_tts(config: &Config) -> elevenlabs_tts::ElevenLabsTts {
     tts
 }
 
-/// Build the optional Translate-mode TTS client (target-language voice). Returns
-/// None unless `translate_tts_backend` is set. Unset fields fall back to the
-/// main tts_* settings.
+/// Build the optional Translate-mode TTS client (target-language voice). Active
+/// when ANY `translate_tts_*` field is set; unset fields fall back to the main
+/// tts_* settings (so e.g. setting only TRANSLATE_TTS_BASE_URL + _VOICE works).
 fn build_translate_tts(config: &Config) -> Option<tts_client::TtsClient> {
-    let backend = config.translate_tts_backend.as_ref()?;
+    // Activate on any translate-tts override, not just the backend.
+    if config.translate_tts_backend.is_none()
+        && config.translate_tts_base_url.is_none()
+        && config.translate_tts_model.is_none()
+        && config.translate_tts_voice.is_none()
+        && config.translate_tts_api_key.is_none()
+    {
+        return None;
+    }
+    let backend = config
+        .translate_tts_backend
+        .clone()
+        .unwrap_or_else(|| config.tts_backend.clone());
     let base_url = config
         .translate_tts_base_url
         .clone()
@@ -1941,7 +1979,7 @@ fn build_translate_tts(config: &Config) -> Option<tts_client::TtsClient> {
             .with_model(model)
             .with_voice(voice)
             .with_instruct(Some(config.tts_instruct.clone()))
-            .with_stream(config.tts_stream)
+            .with_stream(config.translate_tts_stream.unwrap_or(config.tts_stream))
             .with_temperature(config.tts_temperature)
             .with_seed(config.tts_seed),
         ))
@@ -2796,6 +2834,7 @@ fn main() -> Result<()> {
         );
 
         conversation_processor.set_debug(args.debug);
+        conversation_processor.set_assistant_name(config.assistant_name.clone());
 
         // Optional per-mode LLM model overrides (e.g. Khmer model for Translate,
         // stronger tool-caller for Command).
@@ -2805,11 +2844,30 @@ fn main() -> Result<()> {
                 command: config.command_llm_model.clone(),
                 code: config.code_llm_model.clone(),
                 assistant: config.assistant_llm_model.clone(),
+                screen: config.vision_llm_model.clone(),
             },
         );
 
         // Optional separate Translate-mode TTS (target-language voice).
         if let Some(translate_tts) = build_translate_tts(&config) {
+            let t_backend = config
+                .translate_tts_backend
+                .clone()
+                .unwrap_or_else(|| config.tts_backend.clone());
+            let t_base = config
+                .translate_tts_base_url
+                .clone()
+                .unwrap_or_else(|| config.tts_base_url.clone());
+            let t_voice = config
+                .translate_tts_voice
+                .clone()
+                .unwrap_or_else(|| config.tts_voice.clone());
+            if tui_state.is_none() {
+                println!(
+                    "   • Translate TTS: {} @ {} (voice: {})",
+                    t_backend, t_base, t_voice
+                );
+            }
             conversation_processor.set_translate_tts(Arc::new(translate_tts));
         }
 
@@ -3551,7 +3609,8 @@ fn main() -> Result<()> {
                                 VoiceMode::Assistant { .. }
                                 | VoiceMode::Code { .. }
                                 | VoiceMode::Command
-                                | VoiceMode::Translate => {
+                                | VoiceMode::Translate
+                                | VoiceMode::Screen => {
                                     // Set processing flag for TUI
                                     if let Some(ref state) = tui_state_clone {
                                         if let Ok(mut s) = state.lock() {
@@ -4416,6 +4475,7 @@ fn main() -> Result<()> {
                                                     "code" => VoiceMode::Code { language: None },
                                                     "command" => VoiceMode::Command,
                                                     "translate" => VoiceMode::Translate,
+                                                    "screen" => VoiceMode::Screen,
                                                     _ => VoiceMode::Dictation,
                                                 };
 

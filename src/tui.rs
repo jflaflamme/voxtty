@@ -1114,6 +1114,7 @@ fn mode_name(mode: &VoiceMode) -> &str {
         VoiceMode::Code { .. } => "Code",
         VoiceMode::Command => "Command",
         VoiceMode::Translate => "Translate",
+        VoiceMode::Screen => "Screen",
     }
 }
 
@@ -1124,6 +1125,7 @@ fn mode_color(mode: &VoiceMode) -> Style {
         VoiceMode::Code { .. } => Style::default().fg(Color::Rgb(156, 39, 176)), // Purple/Magenta
         VoiceMode::Command => Style::default().fg(Color::Rgb(255, 193, 7)),   // Amber/Gold
         VoiceMode::Translate => Style::default().fg(Color::Rgb(0, 188, 212)), // Cyan/Teal
+        VoiceMode::Screen => Style::default().fg(Color::Rgb(255, 112, 67)),   // Deep orange
     }
 }
 

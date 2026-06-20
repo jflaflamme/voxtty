@@ -3,6 +3,7 @@ use crate::conversation::{ConversationContext, ConversationState, LlmAnalysisRes
 use crate::mcp_tools::McpManager;
 use crate::tts_client::TtsClient;
 use crate::processors::{AudioProcessor, ProcessContext, VoiceMode};
+use crate::screen_capture::ScreenCapture;
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde_json::json;
@@ -71,6 +72,49 @@ mod think_tests {
     }
 }
 
+#[cfg(test)]
+mod arg_tests {
+    use super::{recover_tool_args, text_arg};
+    use serde_json::json;
+
+    #[test]
+    fn text_arg_canonical_and_aliases() {
+        assert_eq!(text_arg(&json!({"text": "hi"})).as_deref(), Some("hi"));
+        assert_eq!(text_arg(&json!({"content": "yo"})).as_deref(), Some("yo"));
+    }
+
+    #[test]
+    fn text_arg_sole_string_fallback() {
+        assert_eq!(text_arg(&json!({"weird": "value"})).as_deref(), Some("value"));
+        // Ambiguous (two strings) → no guess.
+        assert_eq!(text_arg(&json!({"a": "x", "b": "y"})), None);
+    }
+
+    #[test]
+    fn recovers_text_from_malformed_json() {
+        // Unescaped inner quotes break strict JSON; we still salvage the text.
+        let v = recover_tool_args(r#"{"text": "say "Hello World" now"}"#);
+        assert_eq!(v.get("text").and_then(|x| x.as_str()), Some(r#"say "Hello World" now"#));
+    }
+
+    #[test]
+    fn recovers_command_field() {
+        let v = recover_tool_args(r#"{"command": "ls -la", bad}"#);
+        assert_eq!(v.get("command").and_then(|x| x.as_str()), Some("ls -la"));
+    }
+
+    #[test]
+    fn mcp_confirmation_summarizes() {
+        use super::mcp_confirmation;
+        assert_eq!(mcp_confirmation("ok"), "Done.");
+        assert_eq!(mcp_confirmation("Done."), "Done.");
+        assert_eq!(mcp_confirmation("  "), "Done.");
+        // Informative / error results are spoken verbatim.
+        assert_eq!(mcp_confirmation("Battery: 95%"), "Battery: 95%");
+        assert!(mcp_confirmation("Failed (exit 1): nope").starts_with("Failed"));
+    }
+}
+
 /// Parse a tool call that a small model emitted as JSON text in `content`
 /// instead of a structured `tool_calls` array. Accepts the common shapes
 /// `{"name": "...", "arguments": {...}}` / `{"name": "...", "parameters": {...}}`,
@@ -132,6 +176,66 @@ fn parse_inline_tool_call(content: &str) -> Option<(String, serde_json::Value)> 
     Some((name, args))
 }
 
+/// Best-effort extraction of a string value for `key` from malformed JSON args
+/// (small models often break JSON when the value contains quotes). Greedy: takes
+/// from the first `"` after the key to the last `"`, tolerating inner quotes.
+fn loose_string_value(s: &str, key: &str) -> Option<String> {
+    let marker = format!("\"{}\"", key);
+    let start = s.find(&marker)? + marker.len();
+    let rest = s[start..].trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.rfind('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Extract the text payload for `speak`/`type_text`, tolerating small-model
+/// quirks: the canonical "text" key, common aliases, or — failing that — the
+/// sole string value in the object.
+fn text_arg(args: &serde_json::Value) -> Option<String> {
+    for key in ["text", "content", "message", "value"] {
+        if let Some(s) = args.get(key).and_then(|v| v.as_str()) {
+            return Some(s.to_string());
+        }
+    }
+    // Fallback: exactly one string field, whatever its key.
+    if let Some(obj) = args.as_object() {
+        let strings: Vec<&str> = obj.values().filter_map(|v| v.as_str()).collect();
+        if strings.len() == 1 {
+            return Some(strings[0].to_string());
+        }
+    }
+    None
+}
+
+/// Turn an MCP tool result into a spoken confirmation. Trivial acks ("ok",
+/// "done") become "Done."; errors and informative results (status, etc.) are
+/// spoken as-is. Used when the model executes a tool but then fails to produce
+/// its own spoken summary — the action still happened, so confirm it.
+fn mcp_confirmation(result: &str) -> String {
+    let r = result.trim();
+    if r.is_empty()
+        || r.eq_ignore_ascii_case("ok")
+        || r.eq_ignore_ascii_case("done")
+        || r.eq_ignore_ascii_case("done.")
+    {
+        "Done.".to_string()
+    } else {
+        r.to_string()
+    }
+}
+
+/// Recover tool arguments from an arguments string that failed strict JSON
+/// parsing. Salvages the common single-field shapes used by built-in tools.
+fn recover_tool_args(s: &str) -> serde_json::Value {
+    for key in ["text", "command", "confirmation", "mode"] {
+        if let Some(v) = loose_string_value(s, key) {
+            return json!({ key: v });
+        }
+    }
+    json!({})
+}
+
 /// Gated debug logging — only prints when the processor's debug flag is on.
 macro_rules! dbg_log {
     ($self:ident, $($arg:tt)*) => {
@@ -146,6 +250,7 @@ pub struct ModeModels {
     pub command: Option<String>,
     pub code: Option<String>,
     pub assistant: Option<String>,
+    pub screen: Option<String>,
 }
 
 /// Processor that handles bidirectional conversations with clarification
@@ -166,6 +271,8 @@ pub struct ConversationProcessor {
     is_tts_speaking: Arc<Mutex<bool>>,
     tts_interrupt: Arc<AtomicBool>,
     mcp_manager: Option<Arc<Mutex<McpManager>>>,
+    /// Optional name the assistant refers to itself by (Assistant mode).
+    assistant_name: Option<String>,
     /// Gate for verbose [DEBUG] logging (off unless --debug).
     debug: bool,
 }
@@ -194,6 +301,7 @@ impl ConversationProcessor {
             is_tts_speaking,
             tts_interrupt,
             mcp_manager: None,
+            assistant_name: None,
             debug: false,
         }
     }
@@ -201,6 +309,11 @@ impl ConversationProcessor {
     /// Enable verbose [DEBUG] logging (wired from --debug).
     pub fn set_debug(&mut self, debug: bool) {
         self.debug = debug;
+    }
+
+    /// Set the assistant's self-referenced name (Assistant mode identity).
+    pub fn set_assistant_name(&mut self, name: Option<String>) {
+        self.assistant_name = name.filter(|n| !n.trim().is_empty());
     }
 
     /// Set optional per-mode model overrides.
@@ -217,6 +330,7 @@ impl ConversationProcessor {
     fn model_for(&self, mode: &VoiceMode) -> String {
         let over = match mode {
             VoiceMode::Translate => &self.mode_models.translate,
+            VoiceMode::Screen => &self.mode_models.screen,
             VoiceMode::Command => &self.mode_models.command,
             VoiceMode::Code { .. } => &self.mode_models.code,
             VoiceMode::Assistant { .. } => &self.mode_models.assistant,
@@ -282,17 +396,18 @@ impl ConversationProcessor {
             VoiceMode::Command => include_str!("../prompts/command.md").to_string(),
             VoiceMode::Code { .. } => include_str!("../prompts/code.md").to_string(),
             VoiceMode::Translate => crate::translate_prompt(),
+            VoiceMode::Screen => include_str!("../prompts/screen.md").to_string(),
             _ => include_str!("../prompts/assistant.md").to_string(),
         };
 
-        // Translate mode is a pure transcribe→translate task: the date/time,
+        // Translate and Screen are focused, single-purpose tasks: the date/time,
         // user skills, and MCP tool catalog are irrelevant noise. Injecting them
-        // bloats the prompt (~2.4K → ~15K chars with skills) and reliably pushes
-        // small models off-task — e.g. translating into Chinese instead of the
-        // target language. Keep the translate prompt clean.
+        // bloats the prompt and pushes small models off-task. Keep them lean.
         let is_translate = matches!(mode, VoiceMode::Translate);
+        let is_screen = matches!(mode, VoiceMode::Screen);
+        let lean = is_translate || is_screen;
 
-        if !is_translate {
+        if !lean {
             // Inject current date/time so the LLM always knows
             let now = chrono::Local::now();
             system_prompt.push_str(&format!(
@@ -301,13 +416,21 @@ impl ConversationProcessor {
                 now.format("%I:%M %p")
             ));
 
+            // Inject the assistant's name so it identifies itself consistently.
+            if let Some(ref name) = self.assistant_name {
+                system_prompt.push_str(&format!(
+                    "\n\n## IDENTITY\n\nYour name is {0}. If the user asks who you are or your name, say you are {0}.\n",
+                    name
+                ));
+            }
+
             // Inject user skills dropped in ~/.config/voxtty/skills/*.md (hot-reloaded).
             system_prompt.push_str(&crate::skills::skills_prompt_section());
         }
 
         // Append MCP tool descriptions dynamically from manager
         let mcp_tools_snapshot = self.get_mcp_tools();
-        if !is_translate && !mcp_tools_snapshot.is_empty() {
+        if !lean && !mcp_tools_snapshot.is_empty() {
             system_prompt.push_str("\n\n## EXTERNAL TOOLS (MCP)\n\n");
             system_prompt.push_str(
                 "You also have access to external tools provided by MCP servers. \
@@ -341,14 +464,47 @@ impl ConversationProcessor {
             }));
         }
 
-        // Add current transcription
-        messages.push(json!({
-            "role": "user",
+        // Add current transcription. In Screen mode, attach the captured screen:
+        // exact terminal text inline, or a downscaled screenshot as an image part.
+        if is_screen {
+            match crate::screen_capture::capture() {
+                Ok(ScreenCapture::Text(screen_text)) => {
+                    messages.push(json!({
+                        "role": "user",
+                        "content": format!(
+                            "Here is the text currently on my screen:\n\n```\n{}\n```\n\n{}",
+                            screen_text, transcription
+                        ),
+                    }));
+                }
+                Ok(ScreenCapture::Image(data_uri)) => {
+                    messages.push(json!({
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": transcription},
+                            {"type": "image_url", "image_url": {"url": data_uri}},
+                        ],
+                    }));
+                }
+                Err(e) => {
+                    eprintln!("[WARNING] Screen capture failed: {}", e);
+                    return Ok(LlmAnalysisResponse {
+                        needs_clarification: false,
+                        clarification_question: None,
+                        response: Some("🔊 I couldn't capture your screen.".to_string()),
+                        confidence: 0.0,
+                    });
+                }
+            }
+        } else {
             // Pass the user's words verbatim. Do NOT wrap in "Analyze this
             // request:" — small models then narrate an analysis of the request
             // instead of answering it (and the fallback speaks that aloud).
-            "content": transcription
-        }));
+            messages.push(json!({
+                "role": "user",
+                "content": transcription
+            }));
+        }
 
         // Add tool support - tools depend on mode
         let mut tools = serde_json::json!([]);
@@ -387,13 +543,14 @@ impl ConversationProcessor {
             }));
         }
 
-        // speak tool (Assistant, Command, Code, and Translate modes)
+        // speak tool (Assistant, Command, Code, Translate, and Screen modes)
         if matches!(
             mode,
             VoiceMode::Assistant { .. }
                 | VoiceMode::Command
                 | VoiceMode::Code { .. }
                 | VoiceMode::Translate
+                | VoiceMode::Screen
         ) {
             tools.as_array_mut().unwrap().push(json!({
                 "type": "function",
@@ -443,7 +600,7 @@ impl ConversationProcessor {
                         "properties": {
                             "mode": {
                                 "type": "string",
-                                "enum": ["dictation", "assistant", "code", "command", "translate"],
+                                "enum": ["dictation", "assistant", "code", "command", "translate", "screen"],
                                 "description": "The mode to switch to"
                             },
                             "confirmation": {
@@ -483,13 +640,26 @@ impl ConversationProcessor {
         // latency on chain-of-thought before the translation). llama.cpp
         // servers honor this when started with `--jinja`; servers that reject
         // the unknown field get one retry without it below.
-        let mut template_kwargs = matches!(mode, VoiceMode::Translate);
+        // Qwen3-style reasoning models burn the whole budget on hidden thinking
+        // for Translate and (vision) Screen turns; disable it.
+        let mut template_kwargs = matches!(mode, VoiceMode::Translate | VoiceMode::Screen);
 
         // Resolve the model for this mode (per-mode override or default).
         let model = self.model_for(mode);
         if model != self.model {
             dbg_log!(self, "[DEBUG] Using per-mode model for {:?}: {}", mode, model);
         }
+
+        // Small quantized models occasionally return only a <think> block (no
+        // answer, no tool call). Re-sample a couple of times before giving up
+        // rather than surfacing "I had trouble" on a one-off bad sample.
+        let mut think_retries: u8 = 0;
+        const MAX_THINK_RETRIES: u8 = 2;
+
+        // Remember the last MCP tool result so that if the model executes an
+        // action (e.g. switch workspace) but then fails to speak a summary, we
+        // still confirm success instead of falsely reporting failure.
+        let mut last_mcp_result: Option<String> = None;
 
         // MCP tool call loop: iterate until we get a built-in tool call or content
         for iteration in 0..=MAX_MCP_ITERATIONS {
@@ -543,10 +713,31 @@ impl ConversationProcessor {
                         let tool_id = tool_call["id"].as_str().unwrap_or("call_0");
                         dbg_log!(self, "[DEBUG] Tool name: {}", tool_name);
 
-                        if let Some(args_str) = tool_call["function"]["arguments"].as_str() {
+                        {
+                            // `arguments` is usually a JSON-encoded string, but some
+                            // servers return it as an object. Handle both, and
+                            // recover from malformed JSON (small models break it on
+                            // embedded quotes) instead of silently dropping the args.
+                            let raw = &tool_call["function"]["arguments"];
+                            let (args, args_str): (serde_json::Value, String) =
+                                if let Some(s) = raw.as_str() {
+                                    match serde_json::from_str::<serde_json::Value>(s) {
+                                        Ok(v) => (v, s.to_string()),
+                                        Err(e) => {
+                                            let recovered = recover_tool_args(s);
+                                            eprintln!(
+                                                "[WARNING] Tool '{}' arguments were not valid JSON ({}); recovered {} — raw: {}",
+                                                tool_name, e, recovered, s
+                                            );
+                                            (recovered, s.to_string())
+                                        }
+                                    }
+                                } else if raw.is_object() {
+                                    (raw.clone(), raw.to_string())
+                                } else {
+                                    (json!({}), "{}".to_string())
+                                };
                             dbg_log!(self, "[DEBUG] Tool args: {}", args_str);
-                            let args: serde_json::Value =
-                                serde_json::from_str(args_str).unwrap_or(json!({}));
 
                             // Handle built-in tools
                             if BUILTIN_TOOLS.contains(&tool_name) {
@@ -574,6 +765,7 @@ impl ConversationProcessor {
                                     tool_name,
                                     &tool_result[..tool_result.len().min(200)]
                                 );
+                                last_mcp_result = Some(tool_result.clone());
 
                                 // Add assistant message with tool call
                                 messages.push(json!({
@@ -642,11 +834,31 @@ impl ConversationProcessor {
                 // usable answer — speak it directly (🔊 prefix routes it to TTS).
                 if matches!(
                     mode,
-                    VoiceMode::Assistant { .. } | VoiceMode::Code { .. } | VoiceMode::Translate
+                    VoiceMode::Assistant { .. } | VoiceMode::Code { .. } | VoiceMode::Translate | VoiceMode::Screen
                 ) {
                     if content.is_empty() {
                         // The model spent its whole reply on chain-of-thought.
-                        eprintln!("[WARNING] LLM content was only <think> blocks; nothing to speak");
+                        // Re-sample a couple of times before giving up.
+                        if think_retries < MAX_THINK_RETRIES {
+                            think_retries += 1;
+                            eprintln!(
+                                "[WARNING] LLM returned only <think> blocks; retrying ({}/{})",
+                                think_retries, MAX_THINK_RETRIES
+                            );
+                            continue;
+                        }
+                        // If an MCP tool already ran, the action succeeded — the
+                        // model just couldn't summarize it. Confirm success.
+                        if let Some(ref result) = last_mcp_result {
+                            eprintln!("[WARNING] No spoken summary after tool call; confirming the action instead");
+                            return Ok(LlmAnalysisResponse {
+                                needs_clarification: false,
+                                clarification_question: None,
+                                response: Some(format!("🔊 {}", mcp_confirmation(result))),
+                                confidence: 1.0,
+                            });
+                        }
+                        eprintln!("[WARNING] LLM returned only <think> blocks after retries; nothing to speak");
                         return Ok(LlmAnalysisResponse {
                             needs_clarification: false,
                             clarification_question: None,
@@ -675,7 +887,16 @@ impl ConversationProcessor {
             anyhow::bail!("No content or tool call in LLM response");
         }
 
-        // Exceeded max iterations
+        // Exceeded max iterations. If a tool ran, confirm it rather than
+        // reporting a generic limit error.
+        if let Some(ref result) = last_mcp_result {
+            return Ok(LlmAnalysisResponse {
+                needs_clarification: false,
+                clarification_question: None,
+                response: Some(format!("🔊 {}", mcp_confirmation(result))),
+                confidence: 1.0,
+            });
+        }
         Ok(LlmAnalysisResponse {
             needs_clarification: false,
             clarification_question: None,
@@ -713,7 +934,7 @@ impl ConversationProcessor {
                 }
             }
             "speak" => {
-                if let Some(speak_text) = args["text"].as_str() {
+                if let Some(speak_text) = text_arg(args) {
                     dbg_log!(self, "[DEBUG] Extracted speak text: {}", speak_text);
                     Ok(LlmAnalysisResponse {
                         needs_clarification: false,
@@ -722,6 +943,7 @@ impl ConversationProcessor {
                         confidence: 1.0,
                     })
                 } else {
+                    eprintln!("[WARNING] speak tool call had no usable text — args: {}", args);
                     Ok(LlmAnalysisResponse {
                         needs_clarification: false,
                         clarification_question: None,
@@ -731,7 +953,7 @@ impl ConversationProcessor {
                 }
             }
             "type_text" => {
-                if let Some(type_text) = args["text"].as_str() {
+                if let Some(type_text) = text_arg(args) {
                     dbg_log!(self, "[DEBUG] Extracted type text: {}", type_text);
                     Ok(LlmAnalysisResponse {
                         needs_clarification: false,
@@ -740,6 +962,7 @@ impl ConversationProcessor {
                         confidence: 1.0,
                     })
                 } else {
+                    eprintln!("[WARNING] type_text tool call had no usable text — args: {}", args);
                     Ok(LlmAnalysisResponse {
                         needs_clarification: false,
                         clarification_question: None,
@@ -1069,6 +1292,7 @@ impl AudioProcessor for ConversationProcessor {
                 | VoiceMode::Command
                 | VoiceMode::Code { .. }
                 | VoiceMode::Translate
+                | VoiceMode::Screen
         )
     }
 

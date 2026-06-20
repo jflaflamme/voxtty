@@ -21,6 +21,7 @@ pub struct WakeWordDetector {
     dictation_words: Vec<String>,
     command_words: Vec<String>,
     translate_words: Vec<String>,
+    screen_words: Vec<String>,
     pause_words: Vec<String>,
     resume_words: Vec<String>,
 }
@@ -52,6 +53,12 @@ impl WakeWordDetector {
                 "translate mode".to_string(),
                 "translation mode".to_string(),
                 "translator mode".to_string(),
+            ],
+            screen_words: vec![
+                "screen mode".to_string(),
+                "vision mode".to_string(),
+                "look at my screen".to_string(),
+                "look at the screen".to_string(),
             ],
             pause_words: vec![
                 "pause".to_string(),
@@ -118,6 +125,12 @@ impl WakeWordDetector {
         for word in &self.translate_words {
             if lower.contains(word) {
                 return (VoiceCommand::SwitchMode(VoiceMode::Translate), false);
+            }
+        }
+
+        for word in &self.screen_words {
+            if lower.contains(word) {
+                return (VoiceCommand::SwitchMode(VoiceMode::Screen), false);
             }
         }
 
