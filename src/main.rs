@@ -3150,12 +3150,21 @@ fn main() -> Result<()> {
         let mut was_disabled = false;
 
         // Manual-commit VAD state (OpenAI-compatible backends with inert server_vad, e.g. Lemonade).
-        // Each sent chunk is ~100ms; after speech we commit once silence persists.
+        // Each sent chunk is ~100ms. We track the noise floor adaptively (as the recent
+        // minimum average level) so end-of-speech is detected even on noisy mics whose
+        // idle level sits well above a fixed threshold; once silence persists we commit.
         let manual_commit = realtime_config.manual_commit;
-        const MC_SPEECH_THRESHOLD: i16 = 600; // peak amplitude considered speech
+        // Optional absolute floor on the average level below which audio is never speech.
+        let mc_abs_floor: f32 = std::env::var("OPENAI_COMPAT_VAD_THRESHOLD")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0.0);
         const MC_SILENCE_CHUNKS: u32 = 8; // ~800ms of trailing silence -> commit
+        const MC_MAX_SPEECH_CHUNKS: u32 = 200; // ~20s safety commit for runaway segments
         let mut mc_had_speech = false;
         let mut mc_silence_chunks: u32 = 0;
+        let mut mc_speech_chunks: u32 = 0;
+        let mut mc_noise: f32 = 0.0;
 
         // Track if startup message has been played (for bidirectional mode)
         let startup_message_played = Arc::new(Mutex::new(false));
@@ -3482,22 +3491,45 @@ fn main() -> Result<()> {
                     buffer.clear();
 
                     // Manual segmentation: detect end-of-speech locally and commit,
-                    // since the server's VAD won't (e.g. Lemonade).
+                    // since the server's VAD won't (e.g. Lemonade). Uses an adaptive
+                    // noise floor so it works regardless of the mic's idle level.
                     if manual_commit {
-                        if max_sample >= MC_SPEECH_THRESHOLD {
+                        // Track the noise floor as the recent minimum average level:
+                        // snap down to quieter chunks, drift up very slowly otherwise.
+                        if mc_noise == 0.0 || avg_level < mc_noise {
+                            mc_noise = avg_level;
+                        } else {
+                            mc_noise = mc_noise * 0.999 + avg_level * 0.001;
+                        }
+                        // Speech must clearly exceed the noise floor (and any absolute floor).
+                        let threshold = (mc_noise * 2.5 + 400.0).max(mc_abs_floor);
+                        let is_speech = avg_level > threshold;
+
+                        if is_speech {
                             mc_had_speech = true;
                             mc_silence_chunks = 0;
+                            mc_speech_chunks += 1;
                         } else if mc_had_speech {
                             mc_silence_chunks += 1;
-                            if mc_silence_chunks >= MC_SILENCE_CHUNKS {
-                                if let Err(e) = transcriber.commit() {
-                                    if tui_state_clone.is_none() {
-                                        eprintln!("[ERROR] Failed to commit audio: {}", e);
-                                    }
+                        }
+
+                        if mc_had_speech
+                            && (mc_silence_chunks >= MC_SILENCE_CHUNKS
+                                || mc_speech_chunks >= MC_MAX_SPEECH_CHUNKS)
+                        {
+                            if let Err(e) = transcriber.commit() {
+                                if tui_state_clone.is_none() {
+                                    eprintln!("[ERROR] Failed to commit audio: {}", e);
                                 }
-                                mc_had_speech = false;
-                                mc_silence_chunks = 0;
+                            } else if args.debug && tui_state_clone.is_none() {
+                                eprintln!(
+                                    "[manual-commit] committed segment (noise≈{:.0}, thr≈{:.0})",
+                                    mc_noise, threshold
+                                );
                             }
+                            mc_had_speech = false;
+                            mc_silence_chunks = 0;
+                            mc_speech_chunks = 0;
                         }
                     }
                 }
