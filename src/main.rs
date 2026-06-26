@@ -3509,11 +3509,20 @@ fn main() -> Result<()> {
                         let is_speech = avg_level > threshold;
 
                         if is_speech {
-                            if !mc_had_speech && args.debug && tui_state_clone.is_none() {
-                                eprintln!(
-                                    "[manual-commit] speech detected (avg={:.0}, thr={:.0})",
-                                    avg_level, threshold
-                                );
+                            if !mc_had_speech {
+                                if args.debug && tui_state_clone.is_none() {
+                                    eprintln!(
+                                        "[manual-commit] speech detected (avg={:.0}, thr={:.0})",
+                                        avg_level, threshold
+                                    );
+                                }
+                                // Server VAD is off in this mode, so drive the TUI's
+                                // voice-detection indicator from the local VAD.
+                                if let Some(ref state) = tui_state_clone {
+                                    if let Ok(mut s) = state.lock() {
+                                        s.vad_active = true;
+                                    }
+                                }
                             }
                             mc_had_speech = true;
                             mc_silence_chunks = 0;
@@ -3535,6 +3544,12 @@ fn main() -> Result<()> {
                                     "[manual-commit] committed segment (noise≈{:.0}, thr≈{:.0})",
                                     mc_noise, threshold
                                 );
+                            }
+                            // End of utterance: clear the TUI voice-detection indicator.
+                            if let Some(ref state) = tui_state_clone {
+                                if let Ok(mut s) = state.lock() {
+                                    s.vad_active = false;
+                                }
                             }
                             mc_had_speech = false;
                             mc_silence_chunks = 0;
