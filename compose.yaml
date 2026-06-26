@@ -5,9 +5,9 @@
 # Tear down:  podman-compose down
 #
 # Then run voxtty against it:
-#   SPEACHES_BASE_URL=http://localhost:8000 \
+#   OPENAI_COMPAT_BASE_URL=http://localhost:8000 \
 #   TRANSCRIPTION_MODEL_ID=Systran/faster-distil-whisper-small.en \
-#   cargo run --release -- --speaches --realtime --assistant
+#   cargo run --release -- --openai-compat --realtime --assistant
 #
 # Lemonade (Kokoro TTS + batch STT) runs natively on :13305 and is NOT managed
 # here — containerizing it loses NPU/iGPU acceleration on AMD Strix Halo.

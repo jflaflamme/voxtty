@@ -8,7 +8,7 @@ use std::path::Path;
 #[derive(Debug, Clone, PartialEq)]
 pub enum TranscriptionBackend {
     WhisperCpp,
-    Speaches,
+    OpenAICompat,
     OpenAI,
 }
 
@@ -16,8 +16,8 @@ pub enum TranscriptionBackend {
 #[derive(Debug, Clone)]
 pub struct TranscriptionConfig {
     pub backend: TranscriptionBackend,
-    pub speaches_url: String,
-    pub speaches_model: String,
+    pub openai_compat_url: String,
+    pub openai_compat_model: String,
     pub whisper_url: String,
     pub openai_url: String,
     pub openai_api_key: String,
@@ -38,12 +38,12 @@ impl TranscriptionProcessor {
         Self { config }
     }
 
-    fn transcribe_speaches(&self, audio_path: &Path) -> Result<String> {
+    fn transcribe_openai_compat(&self, audio_path: &Path) -> Result<String> {
         let client = reqwest::blocking::Client::new();
         let file = std::fs::read(audio_path)?;
 
         let form = reqwest::blocking::multipart::Form::new()
-            .text("model", self.config.speaches_model.clone())
+            .text("model", self.config.openai_compat_model.clone())
             .part(
                 "file",
                 reqwest::blocking::multipart::Part::bytes(file).file_name(
@@ -61,7 +61,7 @@ impl TranscriptionProcessor {
         }
 
         let response = client
-            .post(&self.config.speaches_url)
+            .post(&self.config.openai_compat_url)
             .multipart(form)
             .send()?
             .json::<Response>()?;
@@ -163,7 +163,7 @@ impl AudioProcessor for TranscriptionProcessor {
         }
 
         match self.config.backend {
-            TranscriptionBackend::Speaches => self.transcribe_speaches(audio_path),
+            TranscriptionBackend::OpenAICompat => self.transcribe_openai_compat(audio_path),
             TranscriptionBackend::WhisperCpp => self.transcribe_whisper_cpp(audio_path),
             TranscriptionBackend::OpenAI => self.transcribe_openai(audio_path),
         }

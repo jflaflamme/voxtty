@@ -1,5 +1,5 @@
 // Realtime WebSocket transcription support
-// Supports OpenAI, Speaches, and ElevenLabs realtime APIs
+// Supports OpenAI, OpenAI-compatible servers, and ElevenLabs realtime APIs
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -16,8 +16,8 @@ use url::Url;
 pub enum RealtimeProvider {
     /// OpenAI Realtime API (wss://api.openai.com/v1/realtime)
     OpenAI,
-    /// Speaches (OpenAI-compatible, self-hosted)
-    Speaches,
+    /// OpenAI-compatible self-hosted server (e.g. Speaches, Lemonade)
+    OpenAICompat,
     /// ElevenLabs ScribeRealtime v2
     ElevenLabs,
     /// Local whisper.cpp server: no realtime WebSocket protocol exists, so this
@@ -31,7 +31,7 @@ pub enum RealtimeProvider {
 pub struct RealtimeConfig {
     pub provider: RealtimeProvider,
     pub api_key: String,
-    /// Base URL (for Speaches self-hosted)
+    /// Base URL (for an OpenAI-compatible self-hosted server)
     pub base_url: Option<String>,
     /// Model to use (e.g., "gpt-4o-transcribe", "deepdml/faster-whisper-large-v3-turbo-ct2")
     pub model: Option<String>,
@@ -43,6 +43,10 @@ pub struct RealtimeConfig {
     pub debug: bool,
     /// Suppress normal output (for TUI mode)
     pub quiet: bool,
+    /// OpenAI-compatible backend only: disable server VAD and drive segmentation with manual
+    /// `input_audio_buffer.commit` from voxtty's local VAD. Required for servers
+    /// whose server_vad is inert (e.g. Lemonade), which otherwise never transcribe.
+    pub manual_commit: bool,
 }
 
 /// Transcription result from realtime API
@@ -85,7 +89,7 @@ pub enum TranscriptionEvent {
 }
 
 // ============================================================================
-// OpenAI/Speaches Realtime Protocol Messages
+// OpenAI / OpenAI-compatible Realtime Protocol Messages
 // ============================================================================
 
 // For OpenAI transcription-only mode (intent=transcription)
@@ -116,22 +120,22 @@ struct OpenAITurnDetection {
     silence_duration_ms: u32,
 }
 
-// For Speaches (uses older session.update format)
+// For OpenAI-compatible servers (older session.update format)
 #[derive(Serialize)]
-struct SpeachesSessionUpdate {
+struct OpenAICompatSessionUpdate {
     #[serde(rename = "type")]
     msg_type: String,
-    session: SpeachesSessionConfig,
+    session: OpenAICompatSessionConfig,
 }
 
 #[derive(Serialize)]
-struct SpeachesSessionConfig {
-    input_audio_transcription: Option<SpeachesTranscriptionConfig>,
+struct OpenAICompatSessionConfig {
+    input_audio_transcription: Option<OpenAICompatTranscriptionConfig>,
     turn_detection: Option<OpenAITurnDetection>,
 }
 
 #[derive(Serialize)]
-struct SpeachesTranscriptionConfig {
+struct OpenAICompatTranscriptionConfig {
     model: String,
 }
 
@@ -627,7 +631,7 @@ fn build_websocket_url(config: &RealtimeConfig) -> Result<Url> {
             url.query_pairs_mut().append_pair("intent", "transcription");
             Ok(url)
         }
-        RealtimeProvider::Speaches => {
+        RealtimeProvider::OpenAICompat => {
             let base = config.base_url.as_deref().unwrap_or("ws://localhost:8000");
             let base = base
                 .replace("http://", "ws://")
@@ -692,7 +696,7 @@ fn build_websocket_request(
                 .header("Authorization", format!("Bearer {}", config.api_key))
                 .header("OpenAI-Beta", "realtime=v1");
         }
-        RealtimeProvider::Speaches => {
+        RealtimeProvider::OpenAICompat => {
             if !config.api_key.is_empty() {
                 request = request.header("Authorization", format!("Bearer {}", config.api_key));
             }
@@ -735,22 +739,28 @@ fn send_initial_config(
             let msg = serde_json::to_string(&session_update)?;
             socket.send(Message::Text(msg))?;
         }
-        RealtimeProvider::Speaches => {
-            // Speaches uses the older session.update format (OpenAI-compatible)
-            let session_update = SpeachesSessionUpdate {
+        RealtimeProvider::OpenAICompat => {
+            // OpenAI-compatible servers use the older session.update format
+            let session_update = OpenAICompatSessionUpdate {
                 msg_type: "session.update".to_string(),
-                session: SpeachesSessionConfig {
-                    input_audio_transcription: Some(SpeachesTranscriptionConfig {
+                session: OpenAICompatSessionConfig {
+                    input_audio_transcription: Some(OpenAICompatTranscriptionConfig {
                         model: config
                             .model
                             .clone()
                             .unwrap_or_else(|| "whisper-1".to_string()),
                     }),
-                    turn_detection: Some(OpenAITurnDetection {
-                        detection_type: "server_vad".to_string(),
-                        threshold: 0.3, // Lowered from 0.5 for better sensitivity
-                        silence_duration_ms: 800, // Reduced from 1000ms for faster response
-                    }),
+                    // Manual-commit mode: turn off server VAD so the server doesn't
+                    // own/auto-clear the buffer; voxtty commits via its local VAD.
+                    turn_detection: if config.manual_commit {
+                        None
+                    } else {
+                        Some(OpenAITurnDetection {
+                            detection_type: "server_vad".to_string(),
+                            threshold: 0.3, // Lowered from 0.5 for better sensitivity
+                            silence_duration_ms: 800, // Reduced from 1000ms for faster response
+                        })
+                    },
                 },
             };
             let msg = serde_json::to_string(&session_update)?;
@@ -794,7 +804,7 @@ fn send_audio_chunk(
     }
 
     let msg = match config.provider {
-        RealtimeProvider::OpenAI | RealtimeProvider::Speaches => {
+        RealtimeProvider::OpenAI | RealtimeProvider::OpenAICompat => {
             let append = OpenAIAudioAppend {
                 msg_type: "input_audio_buffer.append".to_string(),
                 audio: audio_b64,
@@ -823,7 +833,7 @@ fn send_commit(
     config: &RealtimeConfig,
 ) -> Result<()> {
     let msg = match config.provider {
-        RealtimeProvider::OpenAI | RealtimeProvider::Speaches => {
+        RealtimeProvider::OpenAI | RealtimeProvider::OpenAICompat => {
             let commit = OpenAICommit {
                 msg_type: "input_audio_buffer.commit".to_string(),
             };
@@ -846,7 +856,7 @@ fn send_commit(
 
 fn parse_transcription_message(config: &RealtimeConfig, text: &str) -> Option<TranscriptionEvent> {
     match config.provider {
-        RealtimeProvider::OpenAI | RealtimeProvider::Speaches => {
+        RealtimeProvider::OpenAI | RealtimeProvider::OpenAICompat => {
             let response: OpenAIResponse = serde_json::from_str(text).ok()?;
 
             if config.debug {
@@ -871,7 +881,7 @@ fn parse_transcription_message(config: &RealtimeConfig, text: &str) -> Option<Tr
                         .map(TranscriptionEvent::Partial)
                 }
                 "conversation.item.input_audio_transcription.completed" => {
-                    // Legacy conversation API format (for Speaches compatibility)
+                    // Legacy conversation API format (for OpenAI-compatible server compatibility)
                     response.transcript.map(TranscriptionEvent::Final)
                 }
                 "input_audio_buffer.speech_started" => Some(TranscriptionEvent::SpeechStarted),

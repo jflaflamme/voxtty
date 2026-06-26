@@ -62,8 +62,8 @@ use realtime::{RealtimeConfig, RealtimeProvider, RealtimeTranscriber, Transcript
 use tui::ConnectionStatus;
 
 const WHISPER_URL: &str = "http://127.0.0.1:7777/inference";
-const SPEACHES_DEFAULT_URL: &str = "http://localhost:8000/v1/audio/transcriptions";
-const SPEACHES_DEFAULT_MODEL: &str = "Systran/faster-distil-whisper-small.en";
+const OPENAI_COMPAT_DEFAULT_URL: &str = "http://localhost:8000/v1/audio/transcriptions";
+const OPENAI_COMPAT_DEFAULT_MODEL: &str = "Systran/faster-distil-whisper-small.en";
 const YDOTOOL_FALLBACK_SOCKET: &str = "/tmp/.ydotool_socket";
 const VAD_FRAME_MS: usize = 30;
 const SILENCE_DURATION_MS: u64 = 1000;
@@ -79,7 +79,7 @@ fn get_audio_host() -> cpal::Host {
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Backend {
     WhisperCpp,
-    Speaches,
+    OpenAICompat,
     OpenAI,
 }
 
@@ -106,13 +106,19 @@ struct Config {
     #[serde(default = "default_backend")]
     backend: String,
 
-    #[serde(default = "default_speaches_url")]
-    speaches_base_url: String,
+    #[serde(default = "default_openai_compat_url")]
+    openai_compat_base_url: String,
 
-    #[serde(default = "default_speaches_api_key")]
-    speaches_api_key: String,
+    #[serde(default = "default_openai_compat_api_key")]
+    openai_compat_api_key: String,
 
-    #[serde(default = "default_speaches_model")]
+    // Disable server VAD for the OpenAI-compatible realtime backend and let voxtty's local
+    // VAD drive input_audio_buffer.commit. Needed for servers whose server_vad is
+    // inert (e.g. Lemonade). Set via OPENAI_COMPAT_MANUAL_COMMIT.
+    #[serde(default)]
+    openai_compat_manual_commit: bool,
+
+    #[serde(default = "default_openai_compat_model")]
     transcription_model_id: String,
 
     #[serde(default = "default_whisper_url")]
@@ -267,12 +273,12 @@ fn default_backend() -> String {
     "whisper.cpp".to_string()
 }
 
-fn default_speaches_url() -> String {
-    SPEACHES_DEFAULT_URL.to_string()
+fn default_openai_compat_url() -> String {
+    OPENAI_COMPAT_DEFAULT_URL.to_string()
 }
 
-fn default_speaches_model() -> String {
-    SPEACHES_DEFAULT_MODEL.to_string()
+fn default_openai_compat_model() -> String {
+    OPENAI_COMPAT_DEFAULT_MODEL.to_string()
 }
 
 fn default_whisper_url() -> String {
@@ -287,8 +293,8 @@ fn default_elevenlabs_api_key() -> String {
     String::new() // Empty by default, must be set via ELEVENLABS_API_KEY env var
 }
 
-fn default_speaches_api_key() -> String {
-    String::new() // Empty by default; set via SPEACHES_API_KEY for keyed servers (e.g. Lemonade)
+fn default_openai_compat_api_key() -> String {
+    String::new() // Empty by default; set via OPENAI_COMPAT_API_KEY for keyed servers (e.g. Lemonade)
 }
 
 fn default_elevenlabs_voice_id() -> String {
@@ -392,9 +398,10 @@ impl Default for Config {
             barge_in: false,
             audio_device: default_audio_device(),
             backend: default_backend(),
-            speaches_base_url: default_speaches_url(),
-            speaches_api_key: default_speaches_api_key(),
-            transcription_model_id: default_speaches_model(),
+            openai_compat_base_url: default_openai_compat_url(),
+            openai_compat_api_key: default_openai_compat_api_key(),
+            openai_compat_manual_commit: false,
+            transcription_model_id: default_openai_compat_model(),
             whisper_url: default_whisper_url(),
             openai_api_key: default_openai_api_key(),
             transcription_url: default_transcription_url(),
@@ -464,11 +471,15 @@ impl Config {
         if let Ok(backend) = std::env::var("VOXTTY_BACKEND") {
             config.backend = backend;
         }
-        if let Ok(url) = std::env::var("SPEACHES_BASE_URL") {
-            config.speaches_base_url = url;
+        if let Ok(url) = std::env::var("OPENAI_COMPAT_BASE_URL") {
+            config.openai_compat_base_url = url;
         }
-        if let Ok(key) = std::env::var("SPEACHES_API_KEY") {
-            config.speaches_api_key = key;
+        if let Ok(key) = std::env::var("OPENAI_COMPAT_API_KEY") {
+            config.openai_compat_api_key = key;
+        }
+        if let Ok(v) = std::env::var("OPENAI_COMPAT_MANUAL_COMMIT") {
+            config.openai_compat_manual_commit =
+                matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on");
         }
         if let Ok(model) = std::env::var("TRANSCRIPTION_MODEL_ID") {
             config.transcription_model_id = model;
@@ -685,17 +696,22 @@ impl Config {
              # Can be overridden with --device flag or VOXTTY_AUDIO_DEVICE env var\n\
              # audio_device = \"default\"\n\
              #\n\
-             # Backend selection: \"whisper.cpp\" or \"speaches\"\n\
+             # Backend selection: \"whisper.cpp\" or \"openai_compat\"\n\
              # Default: whisper.cpp\n\
-             # Can be overridden with --speaches flag or VOXTTY_BACKEND env var\n\
+             # Can be overridden with --openai-compat flag or VOXTTY_BACKEND env var\n\
              # backend = \"whisper.cpp\"\n\
              #\n\
-             # Speaches backend configuration (used when backend = \"speaches\" or --speaches flag)\n\
-             # speaches_base_url = \"http://localhost:8000/v1/audio/transcriptions\"\n\
+             # OpenAI-compatible backend configuration (used when backend = \"openai-compatible\" or --openai-compat flag)\n\
+             # Works with Speaches, Lemonade, or any OpenAI-compatible transcription server\n\
+             # openai_compat_base_url = \"http://localhost:8000/v1/audio/transcriptions\"\n\
              # transcription_model_id = \"Systran/faster-distil-whisper-small.en\"\n\
              # API key for keyed OpenAI-compatible realtime servers (e.g. Lemonade)\n\
-             # Set via SPEACHES_API_KEY env var; leave empty for keyless servers\n\
-             # speaches_api_key = \"\"\n\
+             # Set via OPENAI_COMPAT_API_KEY env var; leave empty for keyless servers\n\
+             # openai_compat_api_key = \"\"\n\
+             # Manual commit: disable server VAD and segment with voxtty's local VAD.\n\
+             # Required for realtime servers whose server_vad is inert (e.g. Lemonade).\n\
+             # Set via OPENAI_COMPAT_MANUAL_COMMIT=1\n\
+             # openai_compat_manual_commit = false\n\
              #\n\
              # whisper.cpp backend configuration (used when backend = \"whisper.cpp\")\n\
              # whisper_url = \"http://127.0.0.1:7777/inference\"\n\
@@ -716,7 +732,7 @@ impl Config {
              #\n\
              # Transcription URL for assistant mode audio transcription\n\
              # Default: https://api.openai.com/v1/audio/transcriptions (OpenAI Whisper)\n\
-             # Auto-uses Speaches URL when --speaches flag is set\n\
+             # Auto-uses the OpenAI-compatible URL when --openai-compat flag is set\n\
              # transcription_url = \"https://api.openai.com/v1/audio/transcriptions\"\n\
              #\n\
              # System prompts for assistant modes\n\
@@ -758,8 +774,11 @@ struct Args {
     #[arg(long, help = "Enable debug output")]
     debug: bool,
 
-    #[arg(long, help = "Use Speaches API instead of whisper.cpp")]
-    speaches: bool,
+    #[arg(
+        long,
+        help = "Use an OpenAI-compatible realtime server (e.g. Speaches, Lemonade) instead of whisper.cpp"
+    )]
+    openai_compat: bool,
 
     #[arg(long, help = "Use OpenAI Whisper API (cloud, requires OPENAI_API_KEY)")]
     openai: bool,
@@ -1494,7 +1513,7 @@ fn save_wav(samples: &[i16], path: &PathBuf, sample_rate: u32, channels: u16) ->
 }
 
 #[derive(Deserialize)]
-struct SpeachesResponse {
+struct OpenAICompatResponse {
     text: String,
 }
 
@@ -1503,8 +1522,8 @@ fn transcribe_audio(audio_path: &PathBuf, backend: Backend, config: &Config) -> 
     let file = std::fs::read(audio_path)?;
 
     match backend {
-        Backend::Speaches => {
-            let url = &config.speaches_base_url;
+        Backend::OpenAICompat => {
+            let url = &config.openai_compat_base_url;
             let model = &config.transcription_model_id;
 
             let form = reqwest::blocking::multipart::Form::new()
@@ -1524,7 +1543,7 @@ fn transcribe_audio(audio_path: &PathBuf, backend: Backend, config: &Config) -> 
                 .post(url)
                 .multipart(form)
                 .send()?
-                .json::<SpeachesResponse>()?;
+                .json::<OpenAICompatResponse>()?;
 
             Ok(response.text)
         }
@@ -1562,7 +1581,7 @@ fn transcribe_audio(audio_path: &PathBuf, backend: Backend, config: &Config) -> 
                 anyhow::bail!("OpenAI API error: {} - {}", status, error_text);
             }
 
-            let result: SpeachesResponse = response.json()?;
+            let result: OpenAICompatResponse = response.json()?;
             Ok(result.text)
         }
         Backend::WhisperCpp => {
@@ -1821,7 +1840,7 @@ fn type_command(text: &str, config: &Config, debug: bool) -> Result<()> {
 // Removed: playback_audio() now in controls module
 
 /// Check if the transcription backend is available
-fn check_backend_health(url: &str, is_speaches: bool) -> Result<()> {
+fn check_backend_health(url: &str, is_openai_compat: bool) -> Result<()> {
     use std::time::Duration;
 
     let client = reqwest::blocking::Client::builder()
@@ -1829,8 +1848,8 @@ fn check_backend_health(url: &str, is_speaches: bool) -> Result<()> {
         .build()?;
 
     // Extract base URL (remove path for health check)
-    let base_url = if is_speaches {
-        // Speaches: http://localhost:8000/v1/audio/transcriptions -> http://localhost:8000
+    let base_url = if is_openai_compat {
+        // OpenAI-compatible: http://localhost:8000/v1/audio/transcriptions -> http://localhost:8000
         url.replace("/v1/audio/transcriptions", "")
     } else {
         // whisper.cpp: http://127.0.0.1:7777/inference -> http://127.0.0.1:7777
@@ -1838,7 +1857,7 @@ fn check_backend_health(url: &str, is_speaches: bool) -> Result<()> {
     };
 
     // Try to connect to the server
-    let health_url = if is_speaches {
+    let health_url = if is_openai_compat {
         format!("{}/health", base_url)
     } else {
         // whisper.cpp doesn't have a health endpoint, just try the base
@@ -2210,7 +2229,7 @@ fn main() -> Result<()> {
 
     // Check if ElevenLabs backend is being used (flag or config)
     let using_elevenlabs = args.elevenlabs
-        || (!args.openai && !args.speaches && config.backend.to_lowercase() == "elevenlabs");
+        || (!args.openai && !args.openai_compat && config.backend.to_lowercase() == "elevenlabs");
 
     if using_elevenlabs && config.elevenlabs_api_key.is_empty() {
         eprintln!("❌ ElevenLabs backend requires an API key");
@@ -2233,7 +2252,7 @@ fn main() -> Result<()> {
 
     // Check if OpenAI backend is being used (flag or config)
     let using_openai = args.openai
-        || (!args.elevenlabs && !args.speaches && config.backend.to_lowercase() == "openai");
+        || (!args.elevenlabs && !args.openai_compat && config.backend.to_lowercase() == "openai");
 
     // Only the real OpenAI cloud requires a key; local/OpenAI-compatible servers
     // (Lemonade, Speaches, LocalAI, ...) reached via a repointed TRANSCRIPTION_URL do not.
@@ -2289,11 +2308,11 @@ fn main() -> Result<()> {
             "ElevenLabs"
         } else if args.openai {
             "OpenAI"
-        } else if args.speaches {
-            "Speaches"
+        } else if args.openai_compat {
+            "OpenAI-compatible"
         } else {
             match config.backend.to_lowercase().as_str() {
-                "speaches" => "Speaches",
+                "openai-compatible" | "openai_compat" => "OpenAI-compatible",
                 "openai" => "OpenAI",
                 "elevenlabs" => "ElevenLabs",
                 _ => "whisper.cpp",
@@ -2373,16 +2392,16 @@ fn main() -> Result<()> {
     }
 
     // Determine which backend to use (CLI flag overrides config)
-    // Priority: --elevenlabs > --openai > --speaches > config file > whisper.cpp (default)
+    // Priority: --elevenlabs > --openai > --openai_compat > config file > whisper.cpp (default)
     // (To use a local OpenAI-compatible STT server like Lemonade, select the OpenAI
     //  backend and point TRANSCRIPTION_URL / OPENAI_TRANSCRIPTION_MODEL at it.)
     let backend = if args.elevenlabs || args.openai {
         Backend::OpenAI // We'll use realtime provider enum for actual routing
-    } else if args.speaches {
-        Backend::Speaches
+    } else if args.openai_compat {
+        Backend::OpenAICompat
     } else {
         match config.backend.to_lowercase().as_str() {
-            "speaches" => Backend::Speaches,
+            "openai-compatible" | "openai_compat" => Backend::OpenAICompat,
             "openai" => Backend::OpenAI,
             "elevenlabs" => Backend::OpenAI,
             _ => Backend::WhisperCpp,
@@ -2395,15 +2414,15 @@ fn main() -> Result<()> {
             Some(RealtimeProvider::ElevenLabs)
         } else if args.openai {
             Some(RealtimeProvider::OpenAI)
-        } else if args.speaches {
-            Some(RealtimeProvider::Speaches)
+        } else if args.openai_compat {
+            Some(RealtimeProvider::OpenAICompat)
         } else {
             // No cloud provider specified: use local whisper.cpp sliding-window if
             // that's the selected backend (GPU-accelerated via Vulkan/ROCm),
-            // otherwise default to Speaches.
+            // otherwise default to the OpenAI-compatible backend.
             match backend {
                 Backend::WhisperCpp => Some(RealtimeProvider::WhisperCppLocal),
-                _ => Some(RealtimeProvider::Speaches),
+                _ => Some(RealtimeProvider::OpenAICompat),
             }
         }
     } else {
@@ -2434,9 +2453,9 @@ fn main() -> Result<()> {
                     println!("  Mode: ⚡ Realtime WebSocket (~300ms latency)");
                     println!("  ⚠️  Audio streamed to OpenAI servers");
                 }
-                RealtimeProvider::Speaches => {
-                    println!("  Backend: Speaches Realtime (local)");
-                    println!("  URL: {}", config.speaches_base_url);
+                RealtimeProvider::OpenAICompat => {
+                    println!("  Backend: OpenAI-compatible Realtime (local)");
+                    println!("  URL: {}", config.openai_compat_base_url);
                     println!("  Mode: ⚡ Realtime WebSocket (local)");
                 }
                 RealtimeProvider::WhisperCppLocal => {
@@ -2447,9 +2466,9 @@ fn main() -> Result<()> {
             }
         } else {
             match backend {
-                Backend::Speaches => {
-                    println!("  Backend: Speaches (local)");
-                    println!("  URL: {}", config.speaches_base_url);
+                Backend::OpenAICompat => {
+                    println!("  Backend: OpenAI-compatible (local)");
+                    println!("  URL: {}", config.openai_compat_base_url);
                     println!("  Model: {}", config.transcription_model_id);
                 }
                 Backend::OpenAI => {
@@ -2480,8 +2499,8 @@ fn main() -> Result<()> {
     }
 
     // Check backend connectivity
-    let (backend_url, is_speaches_style) = match backend {
-        Backend::Speaches => (config.speaches_base_url.as_str(), true),
+    let (backend_url, is_openai_compat_style) = match backend {
+        Backend::OpenAICompat => (config.openai_compat_base_url.as_str(), true),
         Backend::OpenAI => (config.transcription_url.as_str(), true),
         Backend::WhisperCpp => (config.whisper_url.as_str(), false),
     };
@@ -2489,7 +2508,7 @@ fn main() -> Result<()> {
     if tui_state.is_none() {
         print!("Checking backend... ");
     }
-    match check_backend_health(backend_url, is_speaches_style) {
+    match check_backend_health(backend_url, is_openai_compat_style) {
         Ok(()) => {
             if tui_state.is_none() {
                 println!("✓ Backend is ready");
@@ -2503,10 +2522,10 @@ fn main() -> Result<()> {
                 eprintln!("   Error: {}", e);
                 eprintln!();
                 match backend {
-                    Backend::Speaches => {
-                        eprintln!("💡 To start Speaches backend:");
+                    Backend::OpenAICompat => {
+                        eprintln!("💡 To start an OpenAI-compatible backend:");
                         eprintln!(
-                            "   docker run -d -p 8000:8000 ghcr.io/speaches-ai/speaches:latest"
+                            "   docker run -d -p 8000:8000 ghcr.io/openai_compat-ai/openai_compat:latest"
                         );
                     }
                     Backend::OpenAI => {
@@ -2534,15 +2553,15 @@ fn main() -> Result<()> {
 
     // Register transcription processor (always available)
     let transcription_backend = match backend {
-        Backend::Speaches => TranscriptionBackend::Speaches,
+        Backend::OpenAICompat => TranscriptionBackend::OpenAICompat,
         Backend::OpenAI => TranscriptionBackend::OpenAI,
         Backend::WhisperCpp => TranscriptionBackend::WhisperCpp,
     };
 
     let transcription_config = TranscriptionConfig {
         backend: transcription_backend,
-        speaches_url: config.speaches_base_url.clone(),
-        speaches_model: config.transcription_model_id.clone(),
+        openai_compat_url: config.openai_compat_base_url.clone(),
+        openai_compat_model: config.transcription_model_id.clone(),
         whisper_url: config.whisper_url.clone(),
         openai_url: config.transcription_url.clone(),
         openai_api_key: config.openai_api_key.clone(),
@@ -2719,8 +2738,8 @@ fn main() -> Result<()> {
 
         // Determine transcription URL, model, and API key based on selected backend
         let (transcription_url, transcription_model, transcription_api_key) = match backend {
-            Backend::Speaches => (
-                config.speaches_base_url.clone(),
+            Backend::OpenAICompat => (
+                config.openai_compat_base_url.clone(),
                 config.transcription_model_id.clone(),
                 String::new(),
             ),
@@ -2735,7 +2754,7 @@ fn main() -> Result<()> {
         // Only register AssistantProcessor if NOT in bidirectional mode
         // (bidirectional mode uses ConversationProcessor instead)
         if !args.bidirectional {
-            let assistant_config = SpeachesAssistantConfig {
+            let assistant_config = OpenAICompatAssistantConfig {
                 base_url: llm_base_url.clone(),
                 api_key: llm_api_key,
                 transcription_url,
@@ -2745,7 +2764,7 @@ fn main() -> Result<()> {
                 system_prompt: config.system_prompt.clone(),
                 code_system_prompt: config.code_system_prompt.clone(),
             };
-            let mut backend = SpeachesAssistantBackend::new(assistant_config);
+            let mut backend = OpenAICompatAssistantBackend::new(assistant_config);
             if let Some(ref mgr) = mcp_manager {
                 backend = backend.with_mcp_manager(Arc::clone(mgr));
             }
@@ -3007,15 +3026,15 @@ fn main() -> Result<()> {
             api_key: match provider {
                 RealtimeProvider::ElevenLabs => config.elevenlabs_api_key.clone(),
                 RealtimeProvider::OpenAI => config.openai_api_key.clone(),
-                RealtimeProvider::Speaches => config.speaches_api_key.clone(),
+                RealtimeProvider::OpenAICompat => config.openai_compat_api_key.clone(),
                 RealtimeProvider::WhisperCppLocal => String::new(),
             },
             base_url: match provider {
-                RealtimeProvider::Speaches => Some(config.speaches_base_url.clone()),
+                RealtimeProvider::OpenAICompat => Some(config.openai_compat_base_url.clone()),
                 RealtimeProvider::WhisperCppLocal => Some(config.whisper_url.clone()),
                 _ => None,
             },
-            model: if provider == RealtimeProvider::Speaches {
+            model: if provider == RealtimeProvider::OpenAICompat {
                 Some(config.transcription_model_id.clone())
             } else {
                 None
@@ -3024,6 +3043,9 @@ fn main() -> Result<()> {
             sample_rate: 16000, // We'll resample to 16kHz for realtime
             debug: args.debug,
             quiet: args.tui,
+            // Manual commit only applies to the OpenAI-compatible WS backend.
+            manual_commit: provider == RealtimeProvider::OpenAICompat
+                && config.openai_compat_manual_commit,
         };
 
         // Start realtime transcriber (will be restarted on disconnect)
@@ -3127,6 +3149,14 @@ fn main() -> Result<()> {
         // Track if we were previously disabled (for reconnection on re-enable)
         let mut was_disabled = false;
 
+        // Manual-commit VAD state (OpenAI-compatible backends with inert server_vad, e.g. Lemonade).
+        // Each sent chunk is ~100ms; after speech we commit once silence persists.
+        let manual_commit = realtime_config.manual_commit;
+        const MC_SPEECH_THRESHOLD: i16 = 600; // peak amplitude considered speech
+        const MC_SILENCE_CHUNKS: u32 = 8; // ~800ms of trailing silence -> commit
+        let mut mc_had_speech = false;
+        let mut mc_silence_chunks: u32 = 0;
+
         // Track if startup message has been played (for bidirectional mode)
         let startup_message_played = Arc::new(Mutex::new(false));
         let startup_message_played_clone = startup_message_played.clone();
@@ -3206,9 +3236,9 @@ fn main() -> Result<()> {
                     if s.backend_switch_requested {
                         s.backend_switch_requested = false;
 
-                        // Toggle between OpenAI and Speaches
+                        // Toggle between OpenAI and OpenAI-compatible
                         let new_provider = if matches!(provider, RealtimeProvider::OpenAI) {
-                            RealtimeProvider::Speaches
+                            RealtimeProvider::OpenAICompat
                         } else {
                             RealtimeProvider::OpenAI
                         };
@@ -3218,7 +3248,7 @@ fn main() -> Result<()> {
                             "{} (Realtime)",
                             match new_provider {
                                 RealtimeProvider::OpenAI => "OpenAI",
-                                RealtimeProvider::Speaches => "Speaches",
+                                RealtimeProvider::OpenAICompat => "OpenAICompat",
                                 RealtimeProvider::ElevenLabs => "ElevenLabs",
                                 RealtimeProvider::WhisperCppLocal => "whisper.cpp",
                             }
@@ -3242,15 +3272,15 @@ fn main() -> Result<()> {
                             api_key: match new_provider {
                                 RealtimeProvider::ElevenLabs => config.elevenlabs_api_key.clone(),
                                 RealtimeProvider::OpenAI => config.openai_api_key.clone(),
-                                RealtimeProvider::Speaches
-                                | RealtimeProvider::WhisperCppLocal => String::new(),
+                                RealtimeProvider::OpenAICompat => config.openai_compat_api_key.clone(),
+                                RealtimeProvider::WhisperCppLocal => String::new(),
                             },
-                            base_url: if new_provider == RealtimeProvider::Speaches {
-                                Some(config.speaches_base_url.clone())
+                            base_url: if new_provider == RealtimeProvider::OpenAICompat {
+                                Some(config.openai_compat_base_url.clone())
                             } else {
                                 None
                             },
-                            model: if new_provider == RealtimeProvider::Speaches {
+                            model: if new_provider == RealtimeProvider::OpenAICompat {
                                 Some(config.transcription_model_id.clone())
                             } else {
                                 None
@@ -3259,6 +3289,8 @@ fn main() -> Result<()> {
                             sample_rate: 16000,
                             debug: args.debug,
                             quiet: args.tui,
+                            manual_commit: new_provider == RealtimeProvider::OpenAICompat
+                                && config.openai_compat_manual_commit,
                         };
 
                         transcriber = RealtimeTranscriber::new(new_config);
@@ -3448,6 +3480,26 @@ fn main() -> Result<()> {
                         }
                     }
                     buffer.clear();
+
+                    // Manual segmentation: detect end-of-speech locally and commit,
+                    // since the server's VAD won't (e.g. Lemonade).
+                    if manual_commit {
+                        if max_sample >= MC_SPEECH_THRESHOLD {
+                            mc_had_speech = true;
+                            mc_silence_chunks = 0;
+                        } else if mc_had_speech {
+                            mc_silence_chunks += 1;
+                            if mc_silence_chunks >= MC_SILENCE_CHUNKS {
+                                if let Err(e) = transcriber.commit() {
+                                    if tui_state_clone.is_none() {
+                                        eprintln!("[ERROR] Failed to commit audio: {}", e);
+                                    }
+                                }
+                                mc_had_speech = false;
+                                mc_silence_chunks = 0;
+                            }
+                        }
+                    }
                 }
             } else {
                 // Clear audio buffer while disabled to avoid stale data
@@ -4701,22 +4753,22 @@ fn main() -> Result<()> {
                         // Only show troubleshooting in non-TUI mode
                         if tui_state.is_none() {
                             match backend {
-                                Backend::Speaches => {
+                                Backend::OpenAICompat => {
                                     eprintln!(
-                                        "   Backend: Speaches ({})",
-                                        config.speaches_base_url
+                                        "   Backend: OpenAI-compatible ({})",
+                                        config.openai_compat_base_url
                                     );
                                     eprintln!("   Troubleshooting:");
                                     eprintln!(
-                                    "   • Check if Speaches is running: docker ps | grep speaches"
+                                    "   • Check if the OpenAI-compatible server is running: docker ps | grep speaches"
                                 );
                                     eprintln!(
                                         "   • Test connection: curl {}/health",
                                         config
-                                            .speaches_base_url
+                                            .openai_compat_base_url
                                             .trim_end_matches("/v1/audio/transcriptions")
                                     );
-                                    eprintln!("   • View logs: docker logs speaches");
+                                    eprintln!("   • View logs: docker logs openai_compat");
                                 }
                                 Backend::OpenAI => {
                                     eprintln!(

@@ -14,7 +14,7 @@ const MAX_TOOL_ITERATIONS: usize = 5;
 
 /// Assistant backend trait
 ///
-/// Different backends (Speaches, MCP) implement this trait
+/// Different backends (OpenAI-compatible, MCP) implement this trait
 pub trait AssistantBackend: Send + Sync {
     /// Process audio with LLM assistance
     fn process_with_llm(&self, audio_path: &Path, mode: &VoiceMode, debug: bool) -> Result<String>;
@@ -75,11 +75,11 @@ impl AudioProcessor for AssistantProcessor {
 }
 
 // ============================================================================
-// Speaches Voice Chat Backend
+// OpenAI-compatible Voice Chat Backend
 // ============================================================================
 
 #[derive(Debug, Clone)]
-pub struct SpeachesAssistantConfig {
+pub struct OpenAICompatAssistantConfig {
     pub base_url: String,
     pub api_key: String,
     pub transcription_url: String,
@@ -90,13 +90,13 @@ pub struct SpeachesAssistantConfig {
     pub code_system_prompt: String,
 }
 
-pub struct SpeachesAssistantBackend {
-    config: SpeachesAssistantConfig,
+pub struct OpenAICompatAssistantBackend {
+    config: OpenAICompatAssistantConfig,
     mcp_manager: Option<Arc<Mutex<McpManager>>>,
 }
 
-impl SpeachesAssistantBackend {
-    pub fn new(config: SpeachesAssistantConfig) -> Self {
+impl OpenAICompatAssistantBackend {
+    pub fn new(config: OpenAICompatAssistantConfig) -> Self {
         Self {
             config,
             mcp_manager: None,
@@ -221,7 +221,7 @@ struct ChatResponse {
     choices: Vec<Choice>,
 }
 
-impl SpeachesAssistantBackend {
+impl OpenAICompatAssistantBackend {
     /// Build the tools array for the LLM request
     fn build_tools(&self, mode: &VoiceMode) -> (serde_json::Value, bool) {
         let mut tools = serde_json::json!([]);
@@ -570,11 +570,11 @@ impl SpeachesAssistantBackend {
     }
 }
 
-impl AssistantBackend for SpeachesAssistantBackend {
+impl AssistantBackend for OpenAICompatAssistantBackend {
     fn process_with_llm(&self, audio_path: &Path, mode: &VoiceMode, debug: bool) -> Result<String> {
         if debug {
             println!(
-                "[DEBUG] SpeachesAssistantBackend: Processing with mode {:?}",
+                "[DEBUG] OpenAICompatAssistantBackend: Processing with mode {:?}",
                 mode
             );
         }
@@ -593,7 +593,7 @@ impl AssistantBackend for SpeachesAssistantBackend {
     fn process_text_with_llm(&self, text: &str, mode: &VoiceMode, debug: bool) -> Result<String> {
         if debug {
             println!(
-                "[DEBUG] SpeachesAssistantBackend: Processing text with mode {:?}",
+                "[DEBUG] OpenAICompatAssistantBackend: Processing text with mode {:?}",
                 mode
             );
         }

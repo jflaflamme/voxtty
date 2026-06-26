@@ -1080,7 +1080,7 @@ impl TuiApp {
             ]),
             Line::from(vec![
                 Span::styled("  b            ", Style::default().fg(Color::Cyan)),
-                Span::raw("Switch backend (OpenAI ↔ Speaches)"),
+                Span::raw("Switch backend (OpenAI ↔ OpenAI-compatible)"),
             ]),
             Line::from(""),
             Line::from(Span::styled(

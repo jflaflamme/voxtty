@@ -184,7 +184,7 @@ main() {
     echo ""
     echo "  Quick start:"
     echo "    voxtty --echo-test          # Test your microphone"
-    echo "    voxtty --speaches --tui     # Run with Speaches backend + TUI"
+    echo "    voxtty --openai-compat --tui     # Run with OpenAI-compatible backend + TUI"
     echo ""
     echo "  Docs: https://github.com/${REPO}"
     echo ""
