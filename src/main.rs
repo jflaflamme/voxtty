@@ -109,6 +109,9 @@ struct Config {
     #[serde(default = "default_speaches_url")]
     speaches_base_url: String,
 
+    #[serde(default = "default_speaches_api_key")]
+    speaches_api_key: String,
+
     #[serde(default = "default_speaches_model")]
     transcription_model_id: String,
 
@@ -284,6 +287,10 @@ fn default_elevenlabs_api_key() -> String {
     String::new() // Empty by default, must be set via ELEVENLABS_API_KEY env var
 }
 
+fn default_speaches_api_key() -> String {
+    String::new() // Empty by default; set via SPEACHES_API_KEY for keyed servers (e.g. Lemonade)
+}
+
 fn default_elevenlabs_voice_id() -> String {
     "21m00Tcm4TlvDq8ikWAM".to_string() // Rachel (public ElevenLabs voice)
 }
@@ -386,6 +393,7 @@ impl Default for Config {
             audio_device: default_audio_device(),
             backend: default_backend(),
             speaches_base_url: default_speaches_url(),
+            speaches_api_key: default_speaches_api_key(),
             transcription_model_id: default_speaches_model(),
             whisper_url: default_whisper_url(),
             openai_api_key: default_openai_api_key(),
@@ -458,6 +466,9 @@ impl Config {
         }
         if let Ok(url) = std::env::var("SPEACHES_BASE_URL") {
             config.speaches_base_url = url;
+        }
+        if let Ok(key) = std::env::var("SPEACHES_API_KEY") {
+            config.speaches_api_key = key;
         }
         if let Ok(model) = std::env::var("TRANSCRIPTION_MODEL_ID") {
             config.transcription_model_id = model;
@@ -682,6 +693,9 @@ impl Config {
              # Speaches backend configuration (used when backend = \"speaches\" or --speaches flag)\n\
              # speaches_base_url = \"http://localhost:8000/v1/audio/transcriptions\"\n\
              # transcription_model_id = \"Systran/faster-distil-whisper-small.en\"\n\
+             # API key for keyed OpenAI-compatible realtime servers (e.g. Lemonade)\n\
+             # Set via SPEACHES_API_KEY env var; leave empty for keyless servers\n\
+             # speaches_api_key = \"\"\n\
              #\n\
              # whisper.cpp backend configuration (used when backend = \"whisper.cpp\")\n\
              # whisper_url = \"http://127.0.0.1:7777/inference\"\n\
@@ -2993,7 +3007,8 @@ fn main() -> Result<()> {
             api_key: match provider {
                 RealtimeProvider::ElevenLabs => config.elevenlabs_api_key.clone(),
                 RealtimeProvider::OpenAI => config.openai_api_key.clone(),
-                RealtimeProvider::Speaches | RealtimeProvider::WhisperCppLocal => String::new(),
+                RealtimeProvider::Speaches => config.speaches_api_key.clone(),
+                RealtimeProvider::WhisperCppLocal => String::new(),
             },
             base_url: match provider {
                 RealtimeProvider::Speaches => Some(config.speaches_base_url.clone()),
