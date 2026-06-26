@@ -3501,11 +3501,20 @@ fn main() -> Result<()> {
                         } else {
                             mc_noise = mc_noise * 0.999 + avg_level * 0.001;
                         }
-                        // Speech must clearly exceed the noise floor (and any absolute floor).
-                        let threshold = (mc_noise * 2.5 + 400.0).max(mc_abs_floor);
+                        // Speech must clearly exceed the noise floor. Use a multiple of
+                        // the (possibly very low) floor plus a small absolute minimum so
+                        // both quiet USB mics and noisy internal mics work. The optional
+                        // OPENAI_COMPAT_VAD_THRESHOLD raises the floor if noise false-triggers.
+                        let threshold = (mc_noise * 3.0).max(80.0).max(mc_abs_floor);
                         let is_speech = avg_level > threshold;
 
                         if is_speech {
+                            if !mc_had_speech && args.debug && tui_state_clone.is_none() {
+                                eprintln!(
+                                    "[manual-commit] speech detected (avg={:.0}, thr={:.0})",
+                                    avg_level, threshold
+                                );
+                            }
                             mc_had_speech = true;
                             mc_silence_chunks = 0;
                             mc_speech_chunks += 1;
