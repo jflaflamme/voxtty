@@ -338,6 +338,16 @@ fn default_system_prompt() -> String {
     include_str!("../prompts/assistant.md").to_string()
 }
 
+/// Bidirectional startup greeting, including the assistant's name when set.
+fn startup_greeting(config: &Config) -> String {
+    match config.assistant_name.as_deref().map(str::trim) {
+        Some(name) if !name.is_empty() => {
+            format!("Hey, I am ready to assist you. My name is {}.", name)
+        }
+        _ => "Hey, I am ready to assist you.".to_string(),
+    }
+}
+
 fn default_code_system_prompt() -> String {
     include_str!("../prompts/code.md").to_string()
 }
@@ -440,10 +450,10 @@ impl Config {
         if let Ok(v) = std::env::var("TTS_BARGE_IN") {
             config.barge_in = matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on");
         }
-        if let Ok(device) = std::env::var("VOICETYPR_AUDIO_DEVICE") {
+        if let Ok(device) = std::env::var("VOXTTY_AUDIO_DEVICE") {
             config.audio_device = device;
         }
-        if let Ok(backend) = std::env::var("VOICETYPR_BACKEND") {
+        if let Ok(backend) = std::env::var("VOXTTY_BACKEND") {
             config.backend = backend;
         }
         if let Ok(url) = std::env::var("SPEACHES_BASE_URL") {
@@ -650,7 +660,7 @@ impl Config {
         let toml_string = toml::to_string_pretty(&example)?;
 
         let with_comments = format!(
-            "# VoiceTypr Configuration File\n\
+            "# voxtty Configuration File\n\
              # Location: {}\n\
              #\n\
              # Priority: CLI flags > Environment variables > This file > Built-in defaults\n\
@@ -661,12 +671,12 @@ impl Config {
              #\n\
              # Audio Input Device\n\
              # Default: \"default\" (uses system default)\n\
-             # Can be overridden with --device flag or VOICETYPR_AUDIO_DEVICE env var\n\
+             # Can be overridden with --device flag or VOXTTY_AUDIO_DEVICE env var\n\
              # audio_device = \"default\"\n\
              #\n\
              # Backend selection: \"whisper.cpp\" or \"speaches\"\n\
              # Default: whisper.cpp\n\
-             # Can be overridden with --speaches flag or VOICETYPR_BACKEND env var\n\
+             # Can be overridden with --speaches flag or VOXTTY_BACKEND env var\n\
              # backend = \"whisper.cpp\"\n\
              #\n\
              # Speaches backend configuration (used when backend = \"speaches\" or --speaches flag)\n\
@@ -2390,7 +2400,7 @@ fn main() -> Result<()> {
 
     // Only show console output if TUI is not active
     if tui_state.is_none() {
-        println!("VoiceTypr - Privacy-focused Voice Typing");
+        println!("voxtty - Privacy-focused Voice Typing");
         println!("=========================================\n");
 
         // Show configuration
@@ -3966,14 +3976,14 @@ fn main() -> Result<()> {
                                 drop(played);
 
                                 // Speak startup confirmation via the configured TTS backend
-                                let startup_message = "Hey, I am ready to assist you.";
+                                let startup_message = startup_greeting(&config);
 
                                 if tui_state_clone.is_none() {
                                     println!("🔊 Speaking startup message...");
                                 }
 
                                 spawn_tts(
-                                    startup_message.to_string(),
+                                    startup_message,
                                     TtsSettings::from_config(&config),
                                     tts_interrupt.clone(),
                                     is_tts_speaking.clone(),
@@ -4044,7 +4054,7 @@ fn main() -> Result<()> {
     // confirmation the assistant is ready — the realtime path does this on connect.
     if args.bidirectional && !args.start_paused {
         spawn_tts(
-            "Hey, I am ready to assist you.".to_string(),
+            startup_greeting(&config),
             TtsSettings::from_config(&config),
             tts_interrupt.clone(),
             is_tts_speaking.clone(),

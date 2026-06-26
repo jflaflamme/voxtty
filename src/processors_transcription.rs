@@ -28,7 +28,7 @@ pub struct TranscriptionConfig {
 
 /// Direct transcription processor
 ///
-/// This is the current VoiceTypr behavior - just transcribe audio to text
+/// This is the current voxtty behavior - just transcribe audio to text
 pub struct TranscriptionProcessor {
     config: TranscriptionConfig,
 }

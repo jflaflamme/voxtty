@@ -62,7 +62,7 @@ pub fn start_tray(config: TrayConfig) -> Option<Box<dyn TrayHandle>> {
     // Build tray
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip("VoiceTypr")
+        .with_tooltip("voxtty")
         .with_icon(icon)
         .build()
         .ok()?;
