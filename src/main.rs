@@ -35,6 +35,9 @@ mod app_state;
 mod controls;
 mod conversation;
 mod elevenlabs_tts;
+mod openai_tts;
+mod skills;
+mod tts_client;
 mod mcp_tools;
 mod model_selector;
 mod models_cache;
@@ -43,6 +46,7 @@ mod processors;
 mod processors_assistant;
 mod processors_conversation;
 mod processors_transcription;
+mod screen_capture;
 mod realtime;
 mod sounds;
 mod tui;
@@ -58,8 +62,8 @@ use realtime::{RealtimeConfig, RealtimeProvider, RealtimeTranscriber, Transcript
 use tui::ConnectionStatus;
 
 const WHISPER_URL: &str = "http://127.0.0.1:7777/inference";
-const SPEACHES_DEFAULT_URL: &str = "http://localhost:8000/v1/audio/transcriptions";
-const SPEACHES_DEFAULT_MODEL: &str = "Systran/faster-distil-whisper-small.en";
+const OPENAI_COMPAT_DEFAULT_URL: &str = "http://localhost:8000/v1/audio/transcriptions";
+const OPENAI_COMPAT_DEFAULT_MODEL: &str = "Systran/faster-distil-whisper-small.en";
 const YDOTOOL_FALLBACK_SOCKET: &str = "/tmp/.ydotool_socket";
 const VAD_FRAME_MS: usize = 30;
 const SILENCE_DURATION_MS: u64 = 1000;
@@ -75,7 +79,7 @@ fn get_audio_host() -> cpal::Host {
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Backend {
     WhisperCpp,
-    Speaches,
+    OpenAICompat,
     OpenAI,
 }
 
@@ -84,16 +88,37 @@ struct Config {
     #[serde(default = "default_ydotool_socket")]
     ydotool_socket: String,
 
+    // Keyboard-injection tool for typing: "auto" (prefer wtype, fall back to
+    // ydotool), "wtype" (Wayland-native, no daemon), or "ydotool".
+    #[serde(default = "default_type_tool")]
+    type_tool: String,
+
+    // Allow the user's voice to interrupt TTS playback (barge-in). Off by
+    // default because, without acoustic echo cancellation, the mic hears the
+    // assistant's own output and would constantly self-interrupt. Enable only
+    // with headphones or an AEC mic. Env: TTS_BARGE_IN.
+    #[serde(default)]
+    barge_in: bool,
+
     #[serde(default = "default_audio_device")]
     audio_device: String,
 
     #[serde(default = "default_backend")]
     backend: String,
 
-    #[serde(default = "default_speaches_url")]
-    speaches_base_url: String,
+    #[serde(default = "default_openai_compat_url")]
+    openai_compat_base_url: String,
 
-    #[serde(default = "default_speaches_model")]
+    #[serde(default = "default_openai_compat_api_key")]
+    openai_compat_api_key: String,
+
+    // Disable server VAD for the OpenAI-compatible realtime backend and let voxtty's local
+    // VAD drive input_audio_buffer.commit. Needed for servers whose server_vad is
+    // inert (e.g. Lemonade). Set via OPENAI_COMPAT_MANUAL_COMMIT.
+    #[serde(default)]
+    openai_compat_manual_commit: bool,
+
+    #[serde(default = "default_openai_compat_model")]
     transcription_model_id: String,
 
     #[serde(default = "default_whisper_url")]
@@ -105,6 +130,11 @@ struct Config {
 
     #[serde(default = "default_transcription_url")]
     transcription_url: String,
+
+    // Model name sent to the OpenAI-compatible transcription endpoint.
+    // "whisper-1" for OpenAI cloud; override for local servers (e.g. "Whisper-Base" for Lemonade).
+    #[serde(default = "default_openai_transcription_model")]
+    openai_transcription_model: String,
 
     // ElevenLabs configuration
     #[serde(default = "default_elevenlabs_api_key")]
@@ -118,6 +148,45 @@ struct Config {
 
     #[serde(default)]
     elevenlabs_pronunciation_dict_version: Option<String>,
+
+    // TTS backend selection (independent of the STT backend): "elevenlabs" (default) or "openai".
+    // "openai" uses any OpenAI-compatible /v1/audio/speech server (e.g. Lemonade/Kokoro).
+    #[serde(default = "default_tts_backend")]
+    tts_backend: String,
+
+    #[serde(default = "default_tts_base_url")]
+    tts_base_url: String,
+
+    #[serde(default = "default_tts_api_key")]
+    tts_api_key: String,
+
+    #[serde(default = "default_tts_model")]
+    tts_model: String,
+
+    #[serde(default = "default_tts_voice")]
+    tts_voice: String,
+
+    // Optional style/tone instruction sent as `instruct` (e.g. Qwen3-TTS).
+    // Empty = omitted. Env: TTS_INSTRUCT.
+    #[serde(default)]
+    tts_instruct: String,
+
+    // Stream TTS audio (raw PCM) and play it as it arrives — first sound in
+    // ~0.4s instead of after full generation. Servers without streaming
+    // support fall back to buffered playback automatically.
+    // Env: TTS_STREAM (0/false to disable).
+    #[serde(default = "default_tts_stream")]
+    tts_stream: bool,
+
+    // Optional sampling temperature sent as `temperature` (e.g. Qwen3-TTS;
+    // server default 0.9). Lower = steadier delivery. Env: TTS_TEMPERATURE.
+    #[serde(default)]
+    tts_temperature: Option<f32>,
+
+    // Optional generation seed sent as `seed` for reproducible delivery.
+    // Env: TTS_SEED.
+    #[serde(default)]
+    tts_seed: Option<i64>,
 
     // Assistant mode configuration
     #[serde(default = "default_chat_completion_base_url")]
@@ -134,6 +203,49 @@ struct Config {
 
     #[serde(default = "default_code_system_prompt")]
     code_system_prompt: String,
+
+    // Optional name the assistant calls itself in Assistant mode.
+    // Env: ASSISTANT_NAME.
+    #[serde(default)]
+    assistant_name: Option<String>,
+
+    // Optional per-mode LLM model overrides. Each falls back to `llm_model` when
+    // unset. Lets e.g. a Khmer-tuned model handle Translate while a stronger
+    // tool-caller handles Command. Env: TRANSLATE_LLM_MODEL, COMMAND_LLM_MODEL,
+    // CODE_LLM_MODEL, ASSISTANT_LLM_MODEL. Note: switching modes reloads the
+    // model on single-slot servers (e.g. Lemonade), so the first turn pays load.
+    #[serde(default)]
+    translate_llm_model: Option<String>,
+    #[serde(default)]
+    command_llm_model: Option<String>,
+    #[serde(default)]
+    code_llm_model: Option<String>,
+    #[serde(default)]
+    assistant_llm_model: Option<String>,
+    // Model for Screen mode (must be vision-capable for screenshots; also handles
+    // terminal-text turns). Env: VISION_LLM_MODEL. Falls back to llm_model.
+    #[serde(default)]
+    vision_llm_model: Option<String>,
+
+    // Optional separate TTS backend for Translate mode (target-language voice).
+    // When `translate_tts_backend` is set, Translate-mode speech uses these
+    // settings; every other mode uses the main tts_* settings (English voice).
+    // Unset fields fall back to the corresponding main tts_* value.
+    // Env: TRANSLATE_TTS_BACKEND/BASE_URL/MODEL/VOICE/API_KEY.
+    #[serde(default)]
+    translate_tts_backend: Option<String>,
+    #[serde(default)]
+    translate_tts_base_url: Option<String>,
+    #[serde(default)]
+    translate_tts_model: Option<String>,
+    #[serde(default)]
+    translate_tts_voice: Option<String>,
+    #[serde(default)]
+    translate_tts_api_key: Option<String>,
+    // Per-translate streaming override. Unset = inherit TTS_STREAM.
+    // Env: TRANSLATE_TTS_STREAM (0/false to disable for the Khmer voice only).
+    #[serde(default)]
+    translate_tts_stream: Option<bool>,
 }
 
 fn default_ydotool_socket() -> String {
@@ -149,6 +261,10 @@ fn default_ydotool_socket() -> String {
     }
 }
 
+fn default_type_tool() -> String {
+    "auto".to_string()
+}
+
 fn default_audio_device() -> String {
     "default".to_string()
 }
@@ -157,12 +273,12 @@ fn default_backend() -> String {
     "whisper.cpp".to_string()
 }
 
-fn default_speaches_url() -> String {
-    SPEACHES_DEFAULT_URL.to_string()
+fn default_openai_compat_url() -> String {
+    OPENAI_COMPAT_DEFAULT_URL.to_string()
 }
 
-fn default_speaches_model() -> String {
-    SPEACHES_DEFAULT_MODEL.to_string()
+fn default_openai_compat_model() -> String {
+    OPENAI_COMPAT_DEFAULT_MODEL.to_string()
 }
 
 fn default_whisper_url() -> String {
@@ -177,6 +293,10 @@ fn default_elevenlabs_api_key() -> String {
     String::new() // Empty by default, must be set via ELEVENLABS_API_KEY env var
 }
 
+fn default_openai_compat_api_key() -> String {
+    String::new() // Empty by default; set via OPENAI_COMPAT_API_KEY for keyed servers (e.g. Lemonade)
+}
+
 fn default_elevenlabs_voice_id() -> String {
     "21m00Tcm4TlvDq8ikWAM".to_string() // Rachel (public ElevenLabs voice)
 }
@@ -184,6 +304,34 @@ fn default_elevenlabs_voice_id() -> String {
 fn default_chat_completion_base_url() -> String {
     // Default to Ollama (local) - no API key needed
     "http://localhost:11434/v1".to_string()
+}
+
+fn default_openai_transcription_model() -> String {
+    "whisper-1".to_string() // OpenAI cloud default; override for local servers
+}
+
+fn default_tts_backend() -> String {
+    "elevenlabs".to_string() // Cloud TTS by default; set "openai" for local/OpenAI-compatible
+}
+
+fn default_tts_base_url() -> String {
+    "http://localhost:13305".to_string() // e.g. Lemonade default port
+}
+
+fn default_tts_api_key() -> String {
+    String::new() // Optional, set via TTS_API_KEY env var
+}
+
+fn default_tts_model() -> String {
+    "kokoro-v1".to_string() // Default Kokoro model
+}
+
+fn default_tts_voice() -> String {
+    "shimmer".to_string() // Default Kokoro voice
+}
+
+fn default_tts_stream() -> bool {
+    true // Stream PCM for low latency; falls back to buffered if unsupported
 }
 
 fn default_chat_completion_api_key() -> String {
@@ -203,18 +351,57 @@ fn default_system_prompt() -> String {
     include_str!("../prompts/assistant.md").to_string()
 }
 
+/// Bidirectional startup greeting, including the assistant's name when set.
+fn startup_greeting(config: &Config) -> String {
+    match config.assistant_name.as_deref().map(str::trim) {
+        Some(name) if !name.is_empty() => {
+            format!("Hey, I am ready to assist you. My name is {}.", name)
+        }
+        _ => "Hey, I am ready to assist you.".to_string(),
+    }
+}
+
 fn default_code_system_prompt() -> String {
     include_str!("../prompts/code.md").to_string()
+}
+
+/// Map a common demonym or informal language name to the canonical glottonym
+/// the LLM knows best. Small models confuse a demonym like "Cambodian" with a
+/// neighboring language (it drifts to Lao); the glottonym "Khmer" is rock
+/// solid. Unknown names pass through unchanged.
+fn canonical_language_name(input: &str) -> String {
+    match input.trim().to_lowercase().as_str() {
+        "cambodian" => "Khmer",
+        "filipino" => "Tagalog",
+        "farsi" => "Persian",
+        "castilian" => "Spanish",
+        "mandarin" | "mandarin chinese" => "Chinese",
+        "burmese" => "Burmese",
+        _ => return input.trim().to_string(),
+    }
+    .to_string()
+}
+
+/// Translate-mode system prompt with the target language substituted.
+/// Language comes from TRANSLATE_LANGUAGE (default: Khmer).
+pub fn translate_prompt() -> String {
+    let raw = std::env::var("TRANSLATE_LANGUAGE").unwrap_or_else(|_| "Khmer".to_string());
+    let lang = canonical_language_name(&raw);
+    include_str!("../prompts/translate.md").replace("{{TARGET_LANGUAGE}}", &lang)
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             ydotool_socket: default_ydotool_socket(),
+            type_tool: default_type_tool(),
+            barge_in: false,
             audio_device: default_audio_device(),
             backend: default_backend(),
-            speaches_base_url: default_speaches_url(),
-            transcription_model_id: default_speaches_model(),
+            openai_compat_base_url: default_openai_compat_url(),
+            openai_compat_api_key: default_openai_compat_api_key(),
+            openai_compat_manual_commit: false,
+            transcription_model_id: default_openai_compat_model(),
             whisper_url: default_whisper_url(),
             openai_api_key: default_openai_api_key(),
             transcription_url: default_transcription_url(),
@@ -227,6 +414,28 @@ impl Default for Config {
             llm_model: default_llm_model(),
             system_prompt: default_system_prompt(),
             code_system_prompt: default_code_system_prompt(),
+            openai_transcription_model: default_openai_transcription_model(),
+            tts_backend: default_tts_backend(),
+            tts_base_url: default_tts_base_url(),
+            tts_api_key: default_tts_api_key(),
+            tts_model: default_tts_model(),
+            tts_voice: default_tts_voice(),
+            tts_instruct: String::new(),
+            tts_stream: default_tts_stream(),
+            tts_temperature: None,
+            tts_seed: None,
+            translate_llm_model: None,
+            command_llm_model: None,
+            code_llm_model: None,
+            assistant_llm_model: None,
+            vision_llm_model: None,
+            translate_tts_backend: None,
+            translate_tts_base_url: None,
+            translate_tts_model: None,
+            translate_tts_voice: None,
+            translate_tts_api_key: None,
+            translate_tts_stream: None,
+            assistant_name: None,
         }
     }
 }
@@ -250,14 +459,27 @@ impl Config {
         if let Ok(socket) = std::env::var("YDOTOOL_SOCKET") {
             config.ydotool_socket = socket;
         }
-        if let Ok(device) = std::env::var("VOICETYPR_AUDIO_DEVICE") {
+        if let Ok(tool) = std::env::var("TYPE_TOOL") {
+            config.type_tool = tool;
+        }
+        if let Ok(v) = std::env::var("TTS_BARGE_IN") {
+            config.barge_in = matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on");
+        }
+        if let Ok(device) = std::env::var("VOXTTY_AUDIO_DEVICE") {
             config.audio_device = device;
         }
-        if let Ok(backend) = std::env::var("VOICETYPR_BACKEND") {
+        if let Ok(backend) = std::env::var("VOXTTY_BACKEND") {
             config.backend = backend;
         }
-        if let Ok(url) = std::env::var("SPEACHES_BASE_URL") {
-            config.speaches_base_url = url;
+        if let Ok(url) = std::env::var("OPENAI_COMPAT_BASE_URL") {
+            config.openai_compat_base_url = url;
+        }
+        if let Ok(key) = std::env::var("OPENAI_COMPAT_API_KEY") {
+            config.openai_compat_api_key = key;
+        }
+        if let Ok(v) = std::env::var("OPENAI_COMPAT_MANUAL_COMMIT") {
+            config.openai_compat_manual_commit =
+                matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on");
         }
         if let Ok(model) = std::env::var("TRANSCRIPTION_MODEL_ID") {
             config.transcription_model_id = model;
@@ -272,6 +494,9 @@ impl Config {
         }
         if let Ok(url) = std::env::var("TRANSCRIPTION_URL") {
             config.transcription_url = url;
+        }
+        if let Ok(model) = std::env::var("OPENAI_TRANSCRIPTION_MODEL") {
+            config.openai_transcription_model = model;
         }
 
         // ElevenLabs API key (for --elevenlabs transcription backend)
@@ -292,11 +517,85 @@ impl Config {
         if let Ok(model) = std::env::var("LLM_MODEL") {
             config.llm_model = model;
         }
+        // Per-mode LLM overrides (optional; empty string clears the override).
+        for (var, slot) in [
+            ("TRANSLATE_LLM_MODEL", &mut config.translate_llm_model),
+            ("COMMAND_LLM_MODEL", &mut config.command_llm_model),
+            ("CODE_LLM_MODEL", &mut config.code_llm_model),
+            ("ASSISTANT_LLM_MODEL", &mut config.assistant_llm_model),
+            ("VISION_LLM_MODEL", &mut config.vision_llm_model),
+        ] {
+            if let Ok(m) = std::env::var(var) {
+                *slot = if m.trim().is_empty() { None } else { Some(m) };
+            }
+        }
         if let Ok(prompt) = std::env::var("SYSTEM_PROMPT") {
             config.system_prompt = prompt;
         }
+        if let Ok(name) = std::env::var("ASSISTANT_NAME") {
+            config.assistant_name = if name.trim().is_empty() { None } else { Some(name) };
+        }
         if let Ok(prompt) = std::env::var("CODE_SYSTEM_PROMPT") {
             config.code_system_prompt = prompt;
+        }
+
+        // TTS configuration (independent of STT backend)
+        if let Ok(backend) = std::env::var("TTS_BACKEND") {
+            config.tts_backend = backend;
+        }
+        if let Ok(url) = std::env::var("TTS_BASE_URL") {
+            config.tts_base_url = url;
+        }
+        if let Ok(key) = std::env::var("TTS_API_KEY") {
+            config.tts_api_key = key;
+        }
+        if let Ok(model) = std::env::var("TTS_MODEL") {
+            config.tts_model = model;
+        }
+        if let Ok(voice) = std::env::var("TTS_VOICE") {
+            config.tts_voice = voice;
+        }
+        // Separate Translate-mode TTS backend (target-language voice). Setting
+        // TRANSLATE_TTS_BACKEND activates per-mode TTS routing.
+        if let Ok(v) = std::env::var("TRANSLATE_TTS_BACKEND") {
+            config.translate_tts_backend = if v.trim().is_empty() { None } else { Some(v) };
+        }
+        if let Ok(v) = std::env::var("TRANSLATE_TTS_BASE_URL") {
+            config.translate_tts_base_url = Some(v);
+        }
+        if let Ok(v) = std::env::var("TRANSLATE_TTS_MODEL") {
+            config.translate_tts_model = Some(v);
+        }
+        if let Ok(v) = std::env::var("TRANSLATE_TTS_VOICE") {
+            config.translate_tts_voice = Some(v);
+        }
+        if let Ok(v) = std::env::var("TRANSLATE_TTS_API_KEY") {
+            config.translate_tts_api_key = Some(v);
+        }
+        if let Ok(v) = std::env::var("TRANSLATE_TTS_STREAM") {
+            config.translate_tts_stream =
+                Some(!matches!(v.to_lowercase().as_str(), "0" | "false" | "no" | "off"));
+        }
+        if let Ok(instruct) = std::env::var("TTS_INSTRUCT") {
+            config.tts_instruct = instruct;
+        }
+        if let Ok(stream) = std::env::var("TTS_STREAM") {
+            config.tts_stream = !matches!(
+                stream.to_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            );
+        }
+        if let Ok(temperature) = std::env::var("TTS_TEMPERATURE") {
+            match temperature.parse::<f32>() {
+                Ok(t) => config.tts_temperature = Some(t),
+                Err(_) => eprintln!("Ignoring invalid TTS_TEMPERATURE: {temperature}"),
+            }
+        }
+        if let Ok(seed) = std::env::var("TTS_SEED") {
+            match seed.parse::<i64>() {
+                Ok(s) => config.tts_seed = Some(s),
+                Err(_) => eprintln!("Ignoring invalid TTS_SEED: {seed}"),
+            }
         }
 
         Ok(config)
@@ -383,7 +682,7 @@ impl Config {
         let toml_string = toml::to_string_pretty(&example)?;
 
         let with_comments = format!(
-            "# VoiceTypr Configuration File\n\
+            "# voxtty Configuration File\n\
              # Location: {}\n\
              #\n\
              # Priority: CLI flags > Environment variables > This file > Built-in defaults\n\
@@ -394,17 +693,25 @@ impl Config {
              #\n\
              # Audio Input Device\n\
              # Default: \"default\" (uses system default)\n\
-             # Can be overridden with --device flag or VOICETYPR_AUDIO_DEVICE env var\n\
+             # Can be overridden with --device flag or VOXTTY_AUDIO_DEVICE env var\n\
              # audio_device = \"default\"\n\
              #\n\
-             # Backend selection: \"whisper.cpp\" or \"speaches\"\n\
+             # Backend selection: \"whisper.cpp\" or \"openai_compat\"\n\
              # Default: whisper.cpp\n\
-             # Can be overridden with --speaches flag or VOICETYPR_BACKEND env var\n\
+             # Can be overridden with --openai-compat flag or VOXTTY_BACKEND env var\n\
              # backend = \"whisper.cpp\"\n\
              #\n\
-             # Speaches backend configuration (used when backend = \"speaches\" or --speaches flag)\n\
-             # speaches_base_url = \"http://localhost:8000/v1/audio/transcriptions\"\n\
+             # OpenAI-compatible backend configuration (used when backend = \"openai-compatible\" or --openai-compat flag)\n\
+             # Works with Speaches, Lemonade, or any OpenAI-compatible transcription server\n\
+             # openai_compat_base_url = \"http://localhost:8000/v1/audio/transcriptions\"\n\
              # transcription_model_id = \"Systran/faster-distil-whisper-small.en\"\n\
+             # API key for keyed OpenAI-compatible realtime servers (e.g. Lemonade)\n\
+             # Set via OPENAI_COMPAT_API_KEY env var; leave empty for keyless servers\n\
+             # openai_compat_api_key = \"\"\n\
+             # Manual commit: disable server VAD and segment with voxtty's local VAD.\n\
+             # Required for realtime servers whose server_vad is inert (e.g. Lemonade).\n\
+             # Set via OPENAI_COMPAT_MANUAL_COMMIT=1\n\
+             # openai_compat_manual_commit = false\n\
              #\n\
              # whisper.cpp backend configuration (used when backend = \"whisper.cpp\")\n\
              # whisper_url = \"http://127.0.0.1:7777/inference\"\n\
@@ -425,7 +732,7 @@ impl Config {
              #\n\
              # Transcription URL for assistant mode audio transcription\n\
              # Default: https://api.openai.com/v1/audio/transcriptions (OpenAI Whisper)\n\
-             # Auto-uses Speaches URL when --speaches flag is set\n\
+             # Auto-uses the OpenAI-compatible URL when --openai-compat flag is set\n\
              # transcription_url = \"https://api.openai.com/v1/audio/transcriptions\"\n\
              #\n\
              # System prompts for assistant modes\n\
@@ -467,8 +774,11 @@ struct Args {
     #[arg(long, help = "Enable debug output")]
     debug: bool,
 
-    #[arg(long, help = "Use Speaches API instead of whisper.cpp")]
-    speaches: bool,
+    #[arg(
+        long,
+        help = "Use an OpenAI-compatible realtime server (e.g. Speaches, Lemonade) instead of whisper.cpp"
+    )]
+    openai_compat: bool,
 
     #[arg(long, help = "Use OpenAI Whisper API (cloud, requires OPENAI_API_KEY)")]
     openai: bool,
@@ -484,6 +794,12 @@ struct Args {
 
     #[arg(long, help = "Enable realtime WebSocket streaming (lower latency)")]
     realtime: bool,
+
+    #[arg(
+        long,
+        help = "Start in Translate mode (speaks the TRANSLATE_LANGUAGE translation of your speech)"
+    )]
+    translate: bool,
 
     #[arg(long, help = "Enable system tray icon")]
     tray: bool,
@@ -587,6 +903,8 @@ impl Tray for VoiceTypingTray {
             VoiceMode::Assistant { .. } => ('A', 33, 150, 243), // Blue
             VoiceMode::Code { .. } => ('C', 156, 39, 176), // Purple
             VoiceMode::Command => ('$', 255, 193, 7),     // Yellow/Gold
+            VoiceMode::Translate => ('T', 0, 188, 212),   // Cyan/Teal
+            VoiceMode::Screen => ('S', 255, 112, 67),     // Deep orange
         };
 
         // Override color based on state
@@ -1195,7 +1513,7 @@ fn save_wav(samples: &[i16], path: &PathBuf, sample_rate: u32, channels: u16) ->
 }
 
 #[derive(Deserialize)]
-struct SpeachesResponse {
+struct OpenAICompatResponse {
     text: String,
 }
 
@@ -1204,8 +1522,8 @@ fn transcribe_audio(audio_path: &PathBuf, backend: Backend, config: &Config) -> 
     let file = std::fs::read(audio_path)?;
 
     match backend {
-        Backend::Speaches => {
-            let url = &config.speaches_base_url;
+        Backend::OpenAICompat => {
+            let url = &config.openai_compat_base_url;
             let model = &config.transcription_model_id;
 
             let form = reqwest::blocking::multipart::Form::new()
@@ -1225,13 +1543,13 @@ fn transcribe_audio(audio_path: &PathBuf, backend: Backend, config: &Config) -> 
                 .post(url)
                 .multipart(form)
                 .send()?
-                .json::<SpeachesResponse>()?;
+                .json::<OpenAICompatResponse>()?;
 
             Ok(response.text)
         }
         Backend::OpenAI => {
             let form = reqwest::blocking::multipart::Form::new()
-                .text("model", "whisper-1")
+                .text("model", config.openai_transcription_model.clone())
                 .part(
                     "file",
                     reqwest::blocking::multipart::Part::bytes(file)
@@ -1245,11 +1563,15 @@ fn transcribe_audio(audio_path: &PathBuf, backend: Backend, config: &Config) -> 
                         .mime_str("audio/wav")?,
                 );
 
-            let response = client
-                .post(&config.transcription_url)
-                .header("Authorization", format!("Bearer {}", config.openai_api_key))
-                .multipart(form)
-                .send()?;
+            let mut request = client.post(&config.transcription_url).multipart(form);
+
+            // Local OpenAI-compatible servers (e.g. Lemonade) usually need no auth.
+            if !config.openai_api_key.is_empty() {
+                request = request
+                    .header("Authorization", format!("Bearer {}", config.openai_api_key));
+            }
+
+            let response = request.send()?;
 
             if !response.status().is_success() {
                 let status = response.status();
@@ -1259,13 +1581,15 @@ fn transcribe_audio(audio_path: &PathBuf, backend: Backend, config: &Config) -> 
                 anyhow::bail!("OpenAI API error: {} - {}", status, error_text);
             }
 
-            let result: SpeachesResponse = response.json()?;
+            let result: OpenAICompatResponse = response.json()?;
             Ok(result.text)
         }
         Backend::WhisperCpp => {
             let form = reqwest::blocking::multipart::Form::new()
                 .text("temperature", "0.2")
-                .text("response-format", "text")
+                // OpenAI-style underscore param; the hyphenated form is ignored by
+                // whisper.cpp (returns JSON instead of plain text).
+                .text("response_format", "text")
                 .part(
                     "file",
                     reqwest::blocking::multipart::Part::bytes(file).file_name(
@@ -1283,9 +1607,108 @@ fn transcribe_audio(audio_path: &PathBuf, backend: Backend, config: &Config) -> 
                 .send()?
                 .text()?;
 
-            Ok(response.trim().to_string())
+            // Accept either plain text or a JSON {"text": ...} envelope.
+            let body = response.trim();
+            let text = serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(str::to_string))
+                .unwrap_or_else(|| body.to_string());
+            Ok(text.trim().to_string())
         }
     }
+}
+
+/// Common phrases Whisper hallucinates on silence / low-level noise (e.g. when
+/// it hears the tail of our own TTS). Matched case-insensitively, ignoring
+/// surrounding punctuation/whitespace, so they can be dropped before processing.
+fn is_noise_phrase(text: &str) -> bool {
+    let normalized: String = text
+        .trim()
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    const NOISE: &[&str] = &[
+        "",
+        "you",
+        "thank you",
+        "thank you very much",
+        "thanks for watching",
+        "thanks for watching!",
+        "please subscribe",
+        "bye",
+        "bye bye",
+        "okay",
+        "ok",
+        "mm",
+        "mhm",
+        "uh",
+        "um",
+        "so",
+        "the",
+        "yeah",
+    ];
+    NOISE.contains(&normalized.as_str())
+}
+
+/// Inject `text` as keystrokes (optionally followed by Enter) using the
+/// configured tool. Prefers `wtype` (Wayland-native, no daemon) and falls back
+/// to `ydotool` when `type_tool` is "auto". Returns an error only if no tool
+/// could be launched.
+fn inject_keystrokes(text: &str, config: &Config, press_enter: bool, debug: bool) -> Result<()> {
+    let order: Vec<&str> = match config.type_tool.to_lowercase().as_str() {
+        "wtype" => vec!["wtype"],
+        "ydotool" => vec!["ydotool"],
+        _ => vec!["wtype", "ydotool"], // auto: prefer Wayland-native wtype
+    };
+
+    let mut last_err: Option<anyhow::Error> = None;
+    for tool in order {
+        if debug {
+            println!("[DEBUG] Typing via {}: {:?} (enter={})", tool, text, press_enter);
+        }
+        let result: std::io::Result<()> = if tool == "wtype" {
+            let mut cmd = Command::new("wtype");
+            cmd.arg(text);
+            if press_enter {
+                cmd.arg("-k").arg("Return");
+            }
+            cmd.spawn().map(|mut child| {
+                let _ = child.wait();
+            })
+        } else {
+            Command::new("ydotool")
+                .env("YDOTOOL_SOCKET", &config.ydotool_socket)
+                .arg("type")
+                .arg(text)
+                .spawn()
+                .map(|mut child| {
+                    let _ = child.wait();
+                    if press_enter {
+                        let _ = Command::new("ydotool")
+                            .env("YDOTOOL_SOCKET", &config.ydotool_socket)
+                            .arg("key")
+                            .arg("28:1") // Enter press
+                            .arg("28:0") // Enter release
+                            .spawn();
+                    }
+                })
+        };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if debug {
+                    eprintln!("[DEBUG] {} unavailable: {}", tool, e);
+                }
+                last_err = Some(e.into());
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no typing tool (wtype/ydotool) available")))
 }
 
 fn type_text(text: &str, config: &Config, debug: bool) -> Result<()> {
@@ -1298,17 +1721,7 @@ fn type_text(text: &str, config: &Config, debug: bool) -> Result<()> {
         return Ok(());
     }
 
-    if debug {
-        println!("[DEBUG] Typing text via ydotool: {:?}", text);
-    }
-
-    Command::new("ydotool")
-        .env("YDOTOOL_SOCKET", &config.ydotool_socket)
-        .arg("type")
-        .arg(text)
-        .spawn()?;
-
-    Ok(())
+    inject_keystrokes(text, config, false, debug)
 }
 
 /// Parse command JSON response and extract the shell command
@@ -1420,33 +1833,14 @@ fn parse_command_json(
 }
 
 fn type_command(text: &str, config: &Config, debug: bool) -> Result<()> {
-    if debug {
-        println!("[DEBUG] Typing command via ydotool: {:?}", text);
-    }
-
-    // Type the command text
-    Command::new("ydotool")
-        .env("YDOTOOL_SOCKET", &config.ydotool_socket)
-        .arg("type")
-        .arg(text)
-        .spawn()?
-        .wait()?;
-
-    // Press Enter key (key code 28 for Return/Enter)
-    Command::new("ydotool")
-        .env("YDOTOOL_SOCKET", &config.ydotool_socket)
-        .arg("key")
-        .arg("28:1") // Press
-        .arg("28:0") // Release
-        .spawn()?;
-
-    Ok(())
+    // Type the command and press Enter to execute it.
+    inject_keystrokes(text, config, true, debug)
 }
 
 // Removed: playback_audio() now in controls module
 
 /// Check if the transcription backend is available
-fn check_backend_health(url: &str, is_speaches: bool) -> Result<()> {
+fn check_backend_health(url: &str, is_openai_compat: bool) -> Result<()> {
     use std::time::Duration;
 
     let client = reqwest::blocking::Client::builder()
@@ -1454,8 +1848,8 @@ fn check_backend_health(url: &str, is_speaches: bool) -> Result<()> {
         .build()?;
 
     // Extract base URL (remove path for health check)
-    let base_url = if is_speaches {
-        // Speaches: http://localhost:8000/v1/audio/transcriptions -> http://localhost:8000
+    let base_url = if is_openai_compat {
+        // OpenAI-compatible: http://localhost:8000/v1/audio/transcriptions -> http://localhost:8000
         url.replace("/v1/audio/transcriptions", "")
     } else {
         // whisper.cpp: http://127.0.0.1:7777/inference -> http://127.0.0.1:7777
@@ -1463,7 +1857,7 @@ fn check_backend_health(url: &str, is_speaches: bool) -> Result<()> {
     };
 
     // Try to connect to the server
-    let health_url = if is_speaches {
+    let health_url = if is_openai_compat {
         format!("{}/health", base_url)
     } else {
         // whisper.cpp doesn't have a health endpoint, just try the base
@@ -1585,8 +1979,210 @@ fn create_elevenlabs_tts(config: &Config) -> elevenlabs_tts::ElevenLabsTts {
     tts
 }
 
+/// Build the optional Translate-mode TTS client (target-language voice). Active
+/// when ANY `translate_tts_*` field is set; unset fields fall back to the main
+/// tts_* settings (so e.g. setting only TRANSLATE_TTS_BASE_URL + _VOICE works).
+fn build_translate_tts(config: &Config) -> Option<tts_client::TtsClient> {
+    // Activate on any translate-tts override, not just the backend.
+    if config.translate_tts_backend.is_none()
+        && config.translate_tts_base_url.is_none()
+        && config.translate_tts_model.is_none()
+        && config.translate_tts_voice.is_none()
+        && config.translate_tts_api_key.is_none()
+    {
+        return None;
+    }
+    let backend = config
+        .translate_tts_backend
+        .clone()
+        .unwrap_or_else(|| config.tts_backend.clone());
+    let base_url = config
+        .translate_tts_base_url
+        .clone()
+        .unwrap_or_else(|| config.tts_base_url.clone());
+    let model = config
+        .translate_tts_model
+        .clone()
+        .unwrap_or_else(|| config.tts_model.clone());
+    let voice = config
+        .translate_tts_voice
+        .clone()
+        .unwrap_or_else(|| config.tts_voice.clone());
+    let api_key = config
+        .translate_tts_api_key
+        .clone()
+        .unwrap_or_else(|| config.tts_api_key.clone());
+
+    if backend.to_lowercase() == "openai" {
+        Some(tts_client::TtsClient::OpenAi(
+            openai_tts::OpenAiTts::new(
+                base_url,
+                if api_key.is_empty() { None } else { Some(api_key) },
+            )
+            .with_model(model)
+            .with_voice(voice)
+            .with_instruct(Some(config.tts_instruct.clone()))
+            .with_stream(config.translate_tts_stream.unwrap_or(config.tts_stream))
+            .with_temperature(config.tts_temperature)
+            .with_seed(config.tts_seed),
+        ))
+    } else {
+        // ElevenLabs target voice: reuse the account key, override the voice id.
+        let key = if api_key.is_empty() {
+            config.elevenlabs_api_key.clone()
+        } else {
+            api_key
+        };
+        Some(tts_client::TtsClient::ElevenLabs(
+            elevenlabs_tts::ElevenLabsTts::new(key, voice),
+        ))
+    }
+}
+
+/// Bundle of TTS settings captured from Config, cloneable into the playback thread.
+#[derive(Clone)]
+struct TtsSettings {
+    backend: String,
+    elevenlabs_api_key: String,
+    elevenlabs_voice_id: String,
+    elevenlabs_dict_id: Option<String>,
+    elevenlabs_dict_version: Option<String>,
+    openai_base_url: String,
+    openai_api_key: String,
+    openai_model: String,
+    openai_voice: String,
+    openai_instruct: String,
+    openai_stream: bool,
+    openai_temperature: Option<f32>,
+    openai_seed: Option<i64>,
+}
+
+impl TtsSettings {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            backend: config.tts_backend.to_lowercase(),
+            elevenlabs_api_key: config.elevenlabs_api_key.clone(),
+            elevenlabs_voice_id: config.elevenlabs_voice_id.clone(),
+            elevenlabs_dict_id: config.elevenlabs_pronunciation_dict_id.clone(),
+            elevenlabs_dict_version: config.elevenlabs_pronunciation_dict_version.clone(),
+            openai_base_url: config.tts_base_url.clone(),
+            openai_api_key: config.tts_api_key.clone(),
+            openai_model: config.tts_model.clone(),
+            openai_voice: config.tts_voice.clone(),
+            openai_instruct: config.tts_instruct.clone(),
+            openai_stream: config.tts_stream,
+            openai_temperature: config.tts_temperature,
+            openai_seed: config.tts_seed,
+        }
+    }
+}
+
+/// Speak text on a background thread using the configured TTS backend.
+fn spawn_tts(
+    text: String,
+    tts: TtsSettings,
+    tts_interrupt: Arc<std::sync::atomic::AtomicBool>,
+    is_tts_speaking: Arc<Mutex<bool>>,
+) {
+    let interrupt_clone = tts_interrupt.clone();
+    let is_speaking_clone = is_tts_speaking.clone();
+
+    std::thread::spawn(move || {
+        *is_speaking_clone.lock().unwrap() = true;
+
+        match tts.backend.as_str() {
+            "openai" => {
+                let client = openai_tts::OpenAiTts::new(
+                    tts.openai_base_url,
+                    if tts.openai_api_key.is_empty() {
+                        None
+                    } else {
+                        Some(tts.openai_api_key)
+                    },
+                )
+                .with_model(tts.openai_model)
+                .with_voice(tts.openai_voice)
+                .with_instruct(Some(tts.openai_instruct))
+                .with_stream(tts.openai_stream)
+                .with_temperature(tts.openai_temperature)
+                .with_seed(tts.openai_seed);
+                if let Err(e) = client.speak_interruptible(&text, Some(interrupt_clone)) {
+                    eprintln!("TTS (OpenAI-compatible) Error: {}", e);
+                }
+            }
+            _ => {
+                // ElevenLabs (default)
+                if tts.elevenlabs_api_key.is_empty() {
+                    eprintln!("TTS request ignored: ELEVENLABS_API_KEY not set");
+                    *is_speaking_clone.lock().unwrap() = false;
+                    return;
+                }
+                let mut client = elevenlabs_tts::ElevenLabsTts::new(
+                    tts.elevenlabs_api_key,
+                    tts.elevenlabs_voice_id,
+                );
+                if let (Some(dict_id), Some(version_id)) =
+                    (&tts.elevenlabs_dict_id, &tts.elevenlabs_dict_version)
+                {
+                    client = client.with_pronunciation_dict(
+                        elevenlabs_tts::PronunciationDictionaryLocator {
+                            pronunciation_dictionary_id: dict_id.clone(),
+                            version_id: version_id.clone(),
+                        },
+                    );
+                }
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                if let Err(e) =
+                    rt.block_on(client.speak_and_play_interruptible(&text, Some(interrupt_clone)))
+                {
+                    eprintln!("TTS Error: {}", e);
+                }
+            }
+        }
+
+        *is_speaking_clone.lock().unwrap() = false;
+    });
+}
+
+/// Silence alsa-lib's stderr spam (dmix/dsnoop "unable to open slave" probe
+/// errors printed while cpal enumerates PCM devices on PipeWire systems).
+/// Installs a no-op error handler in place of alsa's default printer.
+#[cfg(target_os = "linux")]
+fn silence_alsa_errors() {
+    use std::os::raw::{c_char, c_int};
+    type Handler =
+        unsafe extern "C" fn(*const c_char, c_int, *const c_char, c_int, *const c_char, ...);
+    unsafe extern "C" fn silent(
+        _file: *const c_char,
+        _line: c_int,
+        _function: *const c_char,
+        _err: c_int,
+        _fmt: *const c_char,
+    ) {
+    }
+    extern "C" {
+        // From alsa-lib (already linked via cpal/alsa-sys).
+        fn snd_lib_error_set_handler(handler: Option<Handler>) -> c_int;
+    }
+    unsafe {
+        // The handler ignores every argument, so passing a non-variadic fn
+        // where a variadic one is expected is safe under the C ABI here.
+        let h: Handler = std::mem::transmute(
+            silent
+                as unsafe extern "C" fn(*const c_char, c_int, *const c_char, c_int, *const c_char),
+        );
+        snd_lib_error_set_handler(Some(h));
+    }
+}
+
 fn main() -> Result<()> {
     let mut args = Args::parse();
+
+    // Quiet ALSA's harmless device-probe errors unless debugging audio.
+    #[cfg(target_os = "linux")]
+    if !args.debug {
+        silence_alsa_errors();
+    }
 
     if args.list_devices {
         return list_input_devices();
@@ -1602,13 +2198,20 @@ fn main() -> Result<()> {
         args.assistant = true;
     }
 
+    // Translate mode needs the LLM pipeline too
+    if args.translate {
+        args.assistant = true;
+    }
+
     // Load config first to validate API keys BEFORE TUI initialization
     let mut config = Config::load()?;
 
     // Initialize core shared state
     let wake_word_detector = WakeWordDetector::new();
-    // Start in Assistant mode if --assistant flag is provided, otherwise Dictation
-    let initial_mode = if args.assistant {
+    // Start in Translate mode if --translate, Assistant if --assistant, else Dictation
+    let initial_mode = if args.translate {
+        VoiceMode::Translate
+    } else if args.assistant {
         VoiceMode::Assistant { context: vec![] }
     } else {
         VoiceMode::Dictation
@@ -1626,7 +2229,7 @@ fn main() -> Result<()> {
 
     // Check if ElevenLabs backend is being used (flag or config)
     let using_elevenlabs = args.elevenlabs
-        || (!args.openai && !args.speaches && config.backend.to_lowercase() == "elevenlabs");
+        || (!args.openai && !args.openai_compat && config.backend.to_lowercase() == "elevenlabs");
 
     if using_elevenlabs && config.elevenlabs_api_key.is_empty() {
         eprintln!("❌ ElevenLabs backend requires an API key");
@@ -1649,11 +2252,15 @@ fn main() -> Result<()> {
 
     // Check if OpenAI backend is being used (flag or config)
     let using_openai = args.openai
-        || (!args.elevenlabs && !args.speaches && config.backend.to_lowercase() == "openai");
+        || (!args.elevenlabs && !args.openai_compat && config.backend.to_lowercase() == "openai");
 
-    if using_openai && config.openai_api_key.is_empty() {
+    // Only the real OpenAI cloud requires a key; local/OpenAI-compatible servers
+    // (Lemonade, Speaches, LocalAI, ...) reached via a repointed TRANSCRIPTION_URL do not.
+    let is_openai_cloud = config.transcription_url.contains("api.openai.com");
+    if using_openai && is_openai_cloud && config.openai_api_key.is_empty() {
         eprintln!("❌ OpenAI Whisper backend requires an API key");
         eprintln!("   Set OPENAI_API_KEY environment variable or add to config file");
+        eprintln!("   (For a local OpenAI-compatible server, point TRANSCRIPTION_URL at it instead.)");
         eprintln!();
         std::process::exit(1);
     }
@@ -1666,7 +2273,7 @@ fn main() -> Result<()> {
             eprintln!();
             std::process::exit(1);
         }
-        if using_openai && config.openai_api_key.is_empty() {
+        if using_openai && is_openai_cloud && config.openai_api_key.is_empty() {
             eprintln!("❌ OpenAI realtime requires an API key");
             eprintln!("   Set OPENAI_API_KEY environment variable or add to config file");
             eprintln!();
@@ -1674,10 +2281,14 @@ fn main() -> Result<()> {
         }
     }
 
-    // Validate bidirectional mode requirements
-    if args.bidirectional && config.elevenlabs_api_key.is_empty() {
-        eprintln!("❌ Bidirectional mode requires ELEVENLABS_API_KEY environment variable");
+    // Validate bidirectional mode requirements.
+    // Only the ElevenLabs TTS backend needs a key; an OpenAI-compatible backend
+    // (e.g. Lemonade/Kokoro) is keyless/local.
+    let tts_is_elevenlabs = config.tts_backend.to_lowercase() != "openai";
+    if args.bidirectional && tts_is_elevenlabs && config.elevenlabs_api_key.is_empty() {
+        eprintln!("❌ Bidirectional mode with ElevenLabs TTS requires ELEVENLABS_API_KEY");
         eprintln!("   Set it with: export ELEVENLABS_API_KEY=your_key");
+        eprintln!("   Or use a local TTS backend: export TTS_BACKEND=openai");
         eprintln!();
         std::process::exit(1);
     }
@@ -1697,11 +2308,11 @@ fn main() -> Result<()> {
             "ElevenLabs"
         } else if args.openai {
             "OpenAI"
-        } else if args.speaches {
-            "Speaches"
+        } else if args.openai_compat {
+            "OpenAI-compatible"
         } else {
             match config.backend.to_lowercase().as_str() {
-                "speaches" => "Speaches",
+                "openai-compatible" | "openai_compat" => "OpenAI-compatible",
                 "openai" => "OpenAI",
                 "elevenlabs" => "ElevenLabs",
                 _ => "whisper.cpp",
@@ -1738,6 +2349,7 @@ fn main() -> Result<()> {
             }
             // Give TUI a moment to clean up, then exit forcefully
             std::thread::sleep(Duration::from_millis(250));
+            let _ = crate::tui::cleanup_terminal();
             std::process::exit(0);
         })
         .expect("Error setting Ctrl-C handler");
@@ -1780,14 +2392,16 @@ fn main() -> Result<()> {
     }
 
     // Determine which backend to use (CLI flag overrides config)
-    // Priority: --elevenlabs > --openai > --speaches > config file > whisper.cpp (default)
+    // Priority: --elevenlabs > --openai > --openai_compat > config file > whisper.cpp (default)
+    // (To use a local OpenAI-compatible STT server like Lemonade, select the OpenAI
+    //  backend and point TRANSCRIPTION_URL / OPENAI_TRANSCRIPTION_MODEL at it.)
     let backend = if args.elevenlabs || args.openai {
         Backend::OpenAI // We'll use realtime provider enum for actual routing
-    } else if args.speaches {
-        Backend::Speaches
+    } else if args.openai_compat {
+        Backend::OpenAICompat
     } else {
         match config.backend.to_lowercase().as_str() {
-            "speaches" => Backend::Speaches,
+            "openai-compatible" | "openai_compat" => Backend::OpenAICompat,
             "openai" => Backend::OpenAI,
             "elevenlabs" => Backend::OpenAI,
             _ => Backend::WhisperCpp,
@@ -1800,11 +2414,16 @@ fn main() -> Result<()> {
             Some(RealtimeProvider::ElevenLabs)
         } else if args.openai {
             Some(RealtimeProvider::OpenAI)
-        } else if args.speaches {
-            Some(RealtimeProvider::Speaches)
+        } else if args.openai_compat {
+            Some(RealtimeProvider::OpenAICompat)
         } else {
-            // Default to Speaches for realtime if no cloud provider specified
-            Some(RealtimeProvider::Speaches)
+            // No cloud provider specified: use local whisper.cpp sliding-window if
+            // that's the selected backend (GPU-accelerated via Vulkan/ROCm),
+            // otherwise default to the OpenAI-compatible backend.
+            match backend {
+                Backend::WhisperCpp => Some(RealtimeProvider::WhisperCppLocal),
+                _ => Some(RealtimeProvider::OpenAICompat),
+            }
         }
     } else {
         None
@@ -1814,7 +2433,7 @@ fn main() -> Result<()> {
 
     // Only show console output if TUI is not active
     if tui_state.is_none() {
-        println!("VoiceTypr - Privacy-focused Voice Typing");
+        println!("voxtty - Privacy-focused Voice Typing");
         println!("=========================================\n");
 
         // Show configuration
@@ -1834,17 +2453,22 @@ fn main() -> Result<()> {
                     println!("  Mode: ⚡ Realtime WebSocket (~300ms latency)");
                     println!("  ⚠️  Audio streamed to OpenAI servers");
                 }
-                RealtimeProvider::Speaches => {
-                    println!("  Backend: Speaches Realtime (local)");
-                    println!("  URL: {}", config.speaches_base_url);
+                RealtimeProvider::OpenAICompat => {
+                    println!("  Backend: OpenAI-compatible Realtime (local)");
+                    println!("  URL: {}", config.openai_compat_base_url);
                     println!("  Mode: ⚡ Realtime WebSocket (local)");
+                }
+                RealtimeProvider::WhisperCppLocal => {
+                    println!("  Backend: whisper.cpp Realtime (local, sliding-window)");
+                    println!("  URL: {}", config.whisper_url);
+                    println!("  Mode: ⚡ Pseudo-realtime over /inference (GPU if built with Vulkan/ROCm)");
                 }
             }
         } else {
             match backend {
-                Backend::Speaches => {
-                    println!("  Backend: Speaches (local)");
-                    println!("  URL: {}", config.speaches_base_url);
+                Backend::OpenAICompat => {
+                    println!("  Backend: OpenAI-compatible (local)");
+                    println!("  URL: {}", config.openai_compat_base_url);
                     println!("  Model: {}", config.transcription_model_id);
                 }
                 Backend::OpenAI => {
@@ -1852,9 +2476,14 @@ fn main() -> Result<()> {
                         println!("  Backend: ElevenLabs (cloud)");
                         println!("  ⚠️  Audio sent to ElevenLabs servers");
                     } else {
-                        println!("  Backend: OpenAI Whisper (cloud)");
+                        println!("  Backend: OpenAI-compatible");
                         println!("  URL: {}", config.transcription_url);
-                        println!("  ⚠️  Audio sent to OpenAI servers");
+                        println!("  Model: {}", config.openai_transcription_model);
+                        if config.openai_api_key.is_empty() {
+                            println!("  (local server — no API key)");
+                        } else {
+                            println!("  ⚠️  Audio sent to remote OpenAI-compatible server");
+                        }
                     }
                 }
                 Backend::WhisperCpp => {
@@ -1870,8 +2499,8 @@ fn main() -> Result<()> {
     }
 
     // Check backend connectivity
-    let (backend_url, is_speaches_style) = match backend {
-        Backend::Speaches => (config.speaches_base_url.as_str(), true),
+    let (backend_url, is_openai_compat_style) = match backend {
+        Backend::OpenAICompat => (config.openai_compat_base_url.as_str(), true),
         Backend::OpenAI => (config.transcription_url.as_str(), true),
         Backend::WhisperCpp => (config.whisper_url.as_str(), false),
     };
@@ -1879,7 +2508,7 @@ fn main() -> Result<()> {
     if tui_state.is_none() {
         print!("Checking backend... ");
     }
-    match check_backend_health(backend_url, is_speaches_style) {
+    match check_backend_health(backend_url, is_openai_compat_style) {
         Ok(()) => {
             if tui_state.is_none() {
                 println!("✓ Backend is ready");
@@ -1893,10 +2522,10 @@ fn main() -> Result<()> {
                 eprintln!("   Error: {}", e);
                 eprintln!();
                 match backend {
-                    Backend::Speaches => {
-                        eprintln!("💡 To start Speaches backend:");
+                    Backend::OpenAICompat => {
+                        eprintln!("💡 To start an OpenAI-compatible backend:");
                         eprintln!(
-                            "   docker run -d -p 8000:8000 ghcr.io/speaches-ai/speaches:latest"
+                            "   docker run -d -p 8000:8000 ghcr.io/openai_compat-ai/openai_compat:latest"
                         );
                     }
                     Backend::OpenAI => {
@@ -1924,18 +2553,19 @@ fn main() -> Result<()> {
 
     // Register transcription processor (always available)
     let transcription_backend = match backend {
-        Backend::Speaches => TranscriptionBackend::Speaches,
+        Backend::OpenAICompat => TranscriptionBackend::OpenAICompat,
         Backend::OpenAI => TranscriptionBackend::OpenAI,
         Backend::WhisperCpp => TranscriptionBackend::WhisperCpp,
     };
 
     let transcription_config = TranscriptionConfig {
         backend: transcription_backend,
-        speaches_url: config.speaches_base_url.clone(),
-        speaches_model: config.transcription_model_id.clone(),
+        openai_compat_url: config.openai_compat_base_url.clone(),
+        openai_compat_model: config.transcription_model_id.clone(),
         whisper_url: config.whisper_url.clone(),
         openai_url: config.transcription_url.clone(),
         openai_api_key: config.openai_api_key.clone(),
+        openai_model: config.openai_transcription_model.clone(),
     };
     registry.register(Box::new(TranscriptionProcessor::new(transcription_config)));
 
@@ -2108,14 +2738,14 @@ fn main() -> Result<()> {
 
         // Determine transcription URL, model, and API key based on selected backend
         let (transcription_url, transcription_model, transcription_api_key) = match backend {
-            Backend::Speaches => (
-                config.speaches_base_url.clone(),
+            Backend::OpenAICompat => (
+                config.openai_compat_base_url.clone(),
                 config.transcription_model_id.clone(),
                 String::new(),
             ),
             Backend::OpenAI => (
                 config.transcription_url.clone(),
-                "whisper-1".to_string(),
+                config.openai_transcription_model.clone(),
                 config.openai_api_key.clone(),
             ),
             Backend::WhisperCpp => (config.whisper_url.clone(), "".to_string(), String::new()),
@@ -2124,7 +2754,7 @@ fn main() -> Result<()> {
         // Only register AssistantProcessor if NOT in bidirectional mode
         // (bidirectional mode uses ConversationProcessor instead)
         if !args.bidirectional {
-            let assistant_config = SpeachesAssistantConfig {
+            let assistant_config = OpenAICompatAssistantConfig {
                 base_url: llm_base_url.clone(),
                 api_key: llm_api_key,
                 transcription_url,
@@ -2134,7 +2764,7 @@ fn main() -> Result<()> {
                 system_prompt: config.system_prompt.clone(),
                 code_system_prompt: config.code_system_prompt.clone(),
             };
-            let mut backend = SpeachesAssistantBackend::new(assistant_config);
+            let mut backend = OpenAICompatAssistantBackend::new(assistant_config);
             if let Some(ref mgr) = mcp_manager {
                 backend = backend.with_mcp_manager(Arc::clone(mgr));
             }
@@ -2170,16 +2800,10 @@ fn main() -> Result<()> {
         }
     }
 
-    // Store ElevenLabs configuration for bidirectional mode startup message
-    let elevenlabs_key_for_startup: Option<String>;
-
     // Register conversation processor if bidirectional mode enabled
     if args.bidirectional {
-        // API key validation already done before TUI initialization
-        if config.elevenlabs_api_key.is_empty() {
-            eprintln!("❌ This should never happen - API key validation was done earlier");
-            std::process::exit(1);
-        }
+        // TTS backend / key validation already done before TUI initialization
+        // (ElevenLabs requires a key; OpenAI-compatible backends are keyless).
 
         // Get LLM configuration (reuse from assistant mode if available, or use defaults)
         let (llm_base_url, llm_api_key, llm_model) = if args.assistant || args.auto {
@@ -2220,11 +2844,28 @@ fn main() -> Result<()> {
 
         use crate::processors_conversation::ConversationProcessor;
 
-        // Create TTS client with pronunciation dictionary support
-        let tts_client = Arc::new(create_elevenlabs_tts(&config));
-
-        // Store API key for startup message (outside this block scope)
-        elevenlabs_key_for_startup = Some(config.elevenlabs_api_key.clone());
+        // Build the TTS client for spoken replies, honoring the selected backend:
+        // OpenAI-compatible (e.g. Lemonade/Kokoro) or ElevenLabs (default).
+        let tts_client = Arc::new(if config.tts_backend.to_lowercase() == "openai" {
+            tts_client::TtsClient::OpenAi(
+                openai_tts::OpenAiTts::new(
+                    config.tts_base_url.clone(),
+                    if config.tts_api_key.is_empty() {
+                        None
+                    } else {
+                        Some(config.tts_api_key.clone())
+                    },
+                )
+                .with_model(config.tts_model.clone())
+                .with_voice(config.tts_voice.clone())
+                .with_instruct(Some(config.tts_instruct.clone()))
+                .with_stream(config.tts_stream)
+                .with_temperature(config.tts_temperature)
+                .with_seed(config.tts_seed),
+            )
+        } else {
+            tts_client::TtsClient::ElevenLabs(create_elevenlabs_tts(&config))
+        });
 
         let mut conversation_processor = ConversationProcessor::with_tts_client(
             llm_base_url.clone(),
@@ -2234,6 +2875,44 @@ fn main() -> Result<()> {
             is_tts_speaking.clone(),
             tts_interrupt.clone(),
         );
+
+        conversation_processor.set_debug(args.debug);
+        conversation_processor.set_assistant_name(config.assistant_name.clone());
+
+        // Optional per-mode LLM model overrides (e.g. Khmer model for Translate,
+        // stronger tool-caller for Command).
+        conversation_processor.set_mode_models(
+            crate::processors_conversation::ModeModels {
+                translate: config.translate_llm_model.clone(),
+                command: config.command_llm_model.clone(),
+                code: config.code_llm_model.clone(),
+                assistant: config.assistant_llm_model.clone(),
+                screen: config.vision_llm_model.clone(),
+            },
+        );
+
+        // Optional separate Translate-mode TTS (target-language voice).
+        if let Some(translate_tts) = build_translate_tts(&config) {
+            let t_backend = config
+                .translate_tts_backend
+                .clone()
+                .unwrap_or_else(|| config.tts_backend.clone());
+            let t_base = config
+                .translate_tts_base_url
+                .clone()
+                .unwrap_or_else(|| config.tts_base_url.clone());
+            let t_voice = config
+                .translate_tts_voice
+                .clone()
+                .unwrap_or_else(|| config.tts_voice.clone());
+            if tui_state.is_none() {
+                println!(
+                    "   • Translate TTS: {} @ {} (voice: {})",
+                    t_backend, t_base, t_voice
+                );
+            }
+            conversation_processor.set_translate_tts(Arc::new(translate_tts));
+        }
 
         // Inject transcription function
         let config_clone = config.clone();
@@ -2261,9 +2940,6 @@ fn main() -> Result<()> {
             }
             println!();
         }
-    } else {
-        // Initialize with None when bidirectional mode is not enabled
-        elevenlabs_key_for_startup = None;
     }
 
     let device_name = if let Some(d) = args.device.clone() {
@@ -2350,14 +3026,15 @@ fn main() -> Result<()> {
             api_key: match provider {
                 RealtimeProvider::ElevenLabs => config.elevenlabs_api_key.clone(),
                 RealtimeProvider::OpenAI => config.openai_api_key.clone(),
-                RealtimeProvider::Speaches => String::new(),
+                RealtimeProvider::OpenAICompat => config.openai_compat_api_key.clone(),
+                RealtimeProvider::WhisperCppLocal => String::new(),
             },
-            base_url: if provider == RealtimeProvider::Speaches {
-                Some(config.speaches_base_url.clone())
-            } else {
-                None
+            base_url: match provider {
+                RealtimeProvider::OpenAICompat => Some(config.openai_compat_base_url.clone()),
+                RealtimeProvider::WhisperCppLocal => Some(config.whisper_url.clone()),
+                _ => None,
             },
-            model: if provider == RealtimeProvider::Speaches {
+            model: if provider == RealtimeProvider::OpenAICompat {
                 Some(config.transcription_model_id.clone())
             } else {
                 None
@@ -2366,6 +3043,9 @@ fn main() -> Result<()> {
             sample_rate: 16000, // We'll resample to 16kHz for realtime
             debug: args.debug,
             quiet: args.tui,
+            // Manual commit only applies to the OpenAI-compatible WS backend.
+            manual_commit: provider == RealtimeProvider::OpenAICompat
+                && config.openai_compat_manual_commit,
         };
 
         // Start realtime transcriber (will be restarted on disconnect)
@@ -2423,8 +3103,10 @@ fn main() -> Result<()> {
                     if let Ok(mut s) = state.lock() {
                         s.audio_level = avg_level;
 
-                        // Update audio history for Sparkline (scale to 0-100)
-                        let level_scaled = (avg_level * 100.0) as u64;
+                        // Update audio history for Sparkline. Mic levels are tiny
+                        // floats (quiet USB mics ~0.01 even on speech), so scale up
+                        // generously; the sparkline auto-scales its max to the window.
+                        let level_scaled = (avg_level * 2000.0) as u64;
                         s.audio_history.push_back(level_scaled);
 
                         // Keep only last 100 samples
@@ -2469,6 +3151,23 @@ fn main() -> Result<()> {
         // Track if we were previously disabled (for reconnection on re-enable)
         let mut was_disabled = false;
 
+        // Manual-commit VAD state (OpenAI-compatible backends with inert server_vad, e.g. Lemonade).
+        // Each sent chunk is ~100ms. We track the noise floor adaptively (as the recent
+        // minimum average level) so end-of-speech is detected even on noisy mics whose
+        // idle level sits well above a fixed threshold; once silence persists we commit.
+        let manual_commit = realtime_config.manual_commit;
+        // Optional absolute floor on the average level below which audio is never speech.
+        let mc_abs_floor: f32 = std::env::var("OPENAI_COMPAT_VAD_THRESHOLD")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0.0);
+        const MC_SILENCE_CHUNKS: u32 = 8; // ~800ms of trailing silence -> commit
+        const MC_MAX_SPEECH_CHUNKS: u32 = 200; // ~20s safety commit for runaway segments
+        let mut mc_had_speech = false;
+        let mut mc_silence_chunks: u32 = 0;
+        let mut mc_speech_chunks: u32 = 0;
+        let mut mc_noise: f32 = 0.0;
+
         // Track if startup message has been played (for bidirectional mode)
         let startup_message_played = Arc::new(Mutex::new(false));
         let startup_message_played_clone = startup_message_played.clone();
@@ -2481,6 +3180,10 @@ fn main() -> Result<()> {
         let mut last_output_enabled = *output_enabled.lock().unwrap();
         let mut last_mode = current_mode.lock().unwrap().clone();
         let mut last_tts_active = false;
+        // Echo guard: while TTS is playing — and for a short tail afterward — the
+        // mic hears our own output (no acoustic echo cancellation). Transcriptions
+        // in this window are dropped so the assistant doesn't talk to itself.
+        let mut tts_echo_guard_until: Option<std::time::Instant> = None;
 
         // Main realtime loop
         loop {
@@ -2498,6 +3201,9 @@ fn main() -> Result<()> {
             if let Some(ref state) = tui_state_clone {
                 if let Ok(mut s) = state.lock() {
                     if s.should_exit {
+                        // Restore the terminal before killing the process — the TUI
+                        // thread's own cleanup may not have run yet.
+                        let _ = crate::tui::cleanup_terminal();
                         std::process::exit(0);
                     }
 
@@ -2541,9 +3247,9 @@ fn main() -> Result<()> {
                     if s.backend_switch_requested {
                         s.backend_switch_requested = false;
 
-                        // Toggle between OpenAI and Speaches
+                        // Toggle between OpenAI and OpenAI-compatible
                         let new_provider = if matches!(provider, RealtimeProvider::OpenAI) {
-                            RealtimeProvider::Speaches
+                            RealtimeProvider::OpenAICompat
                         } else {
                             RealtimeProvider::OpenAI
                         };
@@ -2553,8 +3259,9 @@ fn main() -> Result<()> {
                             "{} (Realtime)",
                             match new_provider {
                                 RealtimeProvider::OpenAI => "OpenAI",
-                                RealtimeProvider::Speaches => "Speaches",
+                                RealtimeProvider::OpenAICompat => "OpenAICompat",
                                 RealtimeProvider::ElevenLabs => "ElevenLabs",
+                                RealtimeProvider::WhisperCppLocal => "whisper.cpp",
                             }
                         );
 
@@ -2576,14 +3283,15 @@ fn main() -> Result<()> {
                             api_key: match new_provider {
                                 RealtimeProvider::ElevenLabs => config.elevenlabs_api_key.clone(),
                                 RealtimeProvider::OpenAI => config.openai_api_key.clone(),
-                                RealtimeProvider::Speaches => String::new(),
+                                RealtimeProvider::OpenAICompat => config.openai_compat_api_key.clone(),
+                                RealtimeProvider::WhisperCppLocal => String::new(),
                             },
-                            base_url: if new_provider == RealtimeProvider::Speaches {
-                                Some(config.speaches_base_url.clone())
+                            base_url: if new_provider == RealtimeProvider::OpenAICompat {
+                                Some(config.openai_compat_base_url.clone())
                             } else {
                                 None
                             },
-                            model: if new_provider == RealtimeProvider::Speaches {
+                            model: if new_provider == RealtimeProvider::OpenAICompat {
                                 Some(config.transcription_model_id.clone())
                             } else {
                                 None
@@ -2592,6 +3300,8 @@ fn main() -> Result<()> {
                             sample_rate: 16000,
                             debug: args.debug,
                             quiet: args.tui,
+                            manual_commit: new_provider == RealtimeProvider::OpenAICompat
+                                && config.openai_compat_manual_commit,
                         };
 
                         transcriber = RealtimeTranscriber::new(new_config);
@@ -2781,6 +3491,73 @@ fn main() -> Result<()> {
                         }
                     }
                     buffer.clear();
+
+                    // Manual segmentation: detect end-of-speech locally and commit,
+                    // since the server's VAD won't (e.g. Lemonade). Uses an adaptive
+                    // noise floor so it works regardless of the mic's idle level.
+                    if manual_commit {
+                        // Track the noise floor as the recent minimum average level:
+                        // snap down to quieter chunks, drift up very slowly otherwise.
+                        if mc_noise == 0.0 || avg_level < mc_noise {
+                            mc_noise = avg_level;
+                        } else {
+                            mc_noise = mc_noise * 0.999 + avg_level * 0.001;
+                        }
+                        // Speech must clearly exceed the noise floor. Use a multiple of
+                        // the (possibly very low) floor plus a small absolute minimum so
+                        // both quiet USB mics and noisy internal mics work. The optional
+                        // OPENAI_COMPAT_VAD_THRESHOLD raises the floor if noise false-triggers.
+                        let threshold = (mc_noise * 3.0).max(80.0).max(mc_abs_floor);
+                        let is_speech = avg_level > threshold;
+
+                        if is_speech {
+                            if !mc_had_speech {
+                                if args.debug && tui_state_clone.is_none() {
+                                    eprintln!(
+                                        "[manual-commit] speech detected (avg={:.0}, thr={:.0})",
+                                        avg_level, threshold
+                                    );
+                                }
+                                // Server VAD is off in this mode, so drive the TUI's
+                                // voice-detection indicator from the local VAD.
+                                if let Some(ref state) = tui_state_clone {
+                                    if let Ok(mut s) = state.lock() {
+                                        s.vad_active = true;
+                                    }
+                                }
+                            }
+                            mc_had_speech = true;
+                            mc_silence_chunks = 0;
+                            mc_speech_chunks += 1;
+                        } else if mc_had_speech {
+                            mc_silence_chunks += 1;
+                        }
+
+                        if mc_had_speech
+                            && (mc_silence_chunks >= MC_SILENCE_CHUNKS
+                                || mc_speech_chunks >= MC_MAX_SPEECH_CHUNKS)
+                        {
+                            if let Err(e) = transcriber.commit() {
+                                if tui_state_clone.is_none() {
+                                    eprintln!("[ERROR] Failed to commit audio: {}", e);
+                                }
+                            } else if args.debug && tui_state_clone.is_none() {
+                                eprintln!(
+                                    "[manual-commit] committed segment (noise≈{:.0}, thr≈{:.0})",
+                                    mc_noise, threshold
+                                );
+                            }
+                            // End of utterance: clear the TUI voice-detection indicator.
+                            if let Some(ref state) = tui_state_clone {
+                                if let Ok(mut s) = state.lock() {
+                                    s.vad_active = false;
+                                }
+                            }
+                            mc_had_speech = false;
+                            mc_silence_chunks = 0;
+                            mc_speech_chunks = 0;
+                        }
+                    }
                 }
             } else {
                 // Clear audio buffer while disabled to avoid stale data
@@ -2796,8 +3573,35 @@ fn main() -> Result<()> {
                             // This handles providers like ElevenLabs that don't emit SpeechStarted
                             let was_tts_active = *is_tts_speaking.lock().unwrap();
                             if was_tts_active {
-                                eprintln!("🛑 User spoke during TTS - interrupting playback!");
-                                tts_interrupt.store(true, std::sync::atomic::Ordering::SeqCst);
+                                // Start/extend the echo-guard window: this Final (and the
+                                // tail that finalizes ~1s after playback stops) is most
+                                // likely our own TTS bleeding into the mic.
+                                tts_echo_guard_until = Some(
+                                    std::time::Instant::now()
+                                        + std::time::Duration::from_millis(1500),
+                                );
+                                // Only honor a real barge-in when explicitly enabled
+                                // (headphones / AEC); otherwise let TTS finish.
+                                if config.barge_in {
+                                    eprintln!("🛑 User spoke during TTS - interrupting playback!");
+                                    tts_interrupt.store(true, std::sync::atomic::Ordering::SeqCst);
+                                }
+                            }
+
+                            // Drop transcriptions captured during TTS or its echo tail,
+                            // and common Whisper silence hallucinations — otherwise the
+                            // assistant transcribes its own voice and replies in a loop.
+                            let in_echo_window = tts_echo_guard_until
+                                .map(|t| std::time::Instant::now() < t)
+                                .unwrap_or(false);
+                            if was_tts_active || in_echo_window || is_noise_phrase(&text) {
+                                if args.debug && tui_state_clone.is_none() {
+                                    eprintln!(
+                                        "[DEBUG] Dropping transcription (echo/noise guard): {:?}",
+                                        text
+                                    );
+                                }
+                                continue;
                             }
 
                             if args.debug && tui_state_clone.is_none() {
@@ -2933,13 +3737,17 @@ fn main() -> Result<()> {
                                         s.current_conversation_id += 1;
                                     }
                                     s.last_input = text.clone();
+                                    // Show what was heard right away, before the LLM replies.
+                                    s.partial_transcription = Some(text.clone());
                                 }
                             }
 
                             let output_text = match mode_snapshot {
                                 VoiceMode::Assistant { .. }
                                 | VoiceMode::Code { .. }
-                                | VoiceMode::Command => {
+                                | VoiceMode::Command
+                                | VoiceMode::Translate
+                                | VoiceMode::Screen => {
                                     // Set processing flag for TUI
                                     if let Some(ref state) = tui_state_clone {
                                         if let Ok(mut s) = state.lock() {
@@ -3104,6 +3912,8 @@ fn main() -> Result<()> {
                                         conversation_id: s.current_conversation_id,
                                     };
                                     s.conversation_history.push_back(entry);
+                                    // Words are now part of the committed exchange.
+                                    s.partial_transcription = None;
 
                                     // Keep only last 50 entries to prevent memory bloat
                                     while s.conversation_history.len() > 50 {
@@ -3166,8 +3976,10 @@ fn main() -> Result<()> {
                         }
                     }
                     TranscriptionEvent::Partial(text) => {
-                        // Interrupt TTS on partial transcript (fastest barge-in)
-                        if !text.is_empty() {
+                        // Interrupt TTS on partial transcript (fastest barge-in).
+                        // Only when barge-in is enabled — otherwise the mic's echo of
+                        // our own TTS would constantly self-interrupt.
+                        if !text.is_empty() && config.barge_in {
                             let is_tts_active = *is_tts_speaking.lock().unwrap();
                             if is_tts_active {
                                 eprintln!("🛑 Partial speech detected - interrupting TTS!");
@@ -3192,9 +4004,11 @@ fn main() -> Result<()> {
                         }
                     }
                     TranscriptionEvent::SpeechStarted => {
-                        // Interrupt TTS if user starts speaking (barge-in)
                         let is_tts_active = *is_tts_speaking.lock().unwrap();
-                        if is_tts_active {
+                        // Interrupt TTS if user starts speaking (barge-in).
+                        // Gated: without echo cancellation the "speech" is usually
+                        // our own TTS echo, so only honor it when barge-in is enabled.
+                        if config.barge_in && is_tts_active {
                             eprintln!("🛑 User started speaking - interrupting AI playback!");
                             tts_interrupt.store(true, std::sync::atomic::Ordering::SeqCst);
                         }
@@ -3290,41 +4104,19 @@ fn main() -> Result<()> {
                                 *played = true;
                                 drop(played);
 
-                                // Speak startup confirmation
-                                if let Some(ref _key) = elevenlabs_key_for_startup {
-                                    let tts = create_elevenlabs_tts(&config);
-                                    let startup_message =
-                                        "Bidirectional mode activated. I'm ready to assist you.";
+                                // Speak startup confirmation via the configured TTS backend
+                                let startup_message = startup_greeting(&config);
 
-                                    if tui_state_clone.is_none() {
-                                        println!("🔊 Speaking startup message...");
-                                    }
-
-                                    // Run TTS in background thread to not block event loop
-                                    let interrupt_for_startup = tts_interrupt.clone();
-                                    let is_tts_speaking_startup = is_tts_speaking.clone();
-                                    std::thread::spawn(move || {
-                                        *is_tts_speaking_startup.lock().unwrap() = true;
-                                        let rt = tokio::runtime::Runtime::new().unwrap();
-                                        match rt.block_on(tts.speak_and_play_interruptible(
-                                            startup_message,
-                                            Some(interrupt_for_startup),
-                                        )) {
-                                            Ok(_) => {
-                                                eprintln!("✅ ElevenLabs TTS: Startup message spoken successfully");
-                                            }
-                                            Err(e) => {
-                                                eprintln!("❌ ElevenLabs TTS Error: {}", e);
-                                                eprintln!(
-                                                    "   Check: 1) ELEVENLABS_API_KEY is valid"
-                                                );
-                                                eprintln!("          2) Voice ID is correct");
-                                                eprintln!("          3) mpv/ffplay/aplay/paplay is installed");
-                                            }
-                                        }
-                                        *is_tts_speaking_startup.lock().unwrap() = false;
-                                    });
+                                if tui_state_clone.is_none() {
+                                    println!("🔊 Speaking startup message...");
                                 }
+
+                                spawn_tts(
+                                    startup_message,
+                                    TtsSettings::from_config(&config),
+                                    tts_interrupt.clone(),
+                                    is_tts_speaking.clone(),
+                                );
                             }
                         }
                     }
@@ -3387,6 +4179,17 @@ fn main() -> Result<()> {
         }
     }
 
+    // In bidirectional (batch) mode, speak a startup greeting so there's audible
+    // confirmation the assistant is ready — the realtime path does this on connect.
+    if args.bidirectional && !args.start_paused {
+        spawn_tts(
+            startup_greeting(&config),
+            TtsSettings::from_config(&config),
+            tts_interrupt.clone(),
+            is_tts_speaking.clone(),
+        );
+    }
+
     let mut last_paused = *paused.lock().unwrap();
     let mut last_mode = current_mode.lock().unwrap().clone();
 
@@ -3395,6 +4198,9 @@ fn main() -> Result<()> {
         if let Some(ref state) = tui_state {
             if let Ok(mut s) = state.lock() {
                 if s.should_exit {
+                    // Restore the terminal before killing the process — the TUI
+                    // thread's own cleanup may not have run yet.
+                    let _ = crate::tui::cleanup_terminal();
                     std::process::exit(0);
                 }
 
@@ -3705,6 +4511,7 @@ fn main() -> Result<()> {
                             VoiceMode::Assistant { .. }
                                 | VoiceMode::Code { .. }
                                 | VoiceMode::Command
+                                | VoiceMode::Translate
                         ) {
                             if let Some(ref state) = tui_state {
                                 if let Ok(mut s) = state.lock() {
@@ -3753,30 +4560,11 @@ fn main() -> Result<()> {
                                                             speak_text
                                                         );
                                                     }
-                                                    if !config.elevenlabs_api_key.is_empty() {
-                                                        let tts = create_elevenlabs_tts(&config);
-                                                        let speak_text_owned =
-                                                            speak_text.to_string();
-                                                        let interrupt_clone = tts_interrupt.clone();
-                                                        let is_speaking_clone =
-                                                            is_tts_speaking.clone();
-                                                        std::thread::spawn(move || {
-                                                            *is_speaking_clone.lock().unwrap() =
-                                                                true;
-                                                            let rt = tokio::runtime::Runtime::new()
-                                                                .unwrap();
-                                                            if let Err(e) = rt.block_on(
-                                                                tts.speak_and_play_interruptible(
-                                                                    &speak_text_owned,
-                                                                    Some(interrupt_clone),
-                                                                ),
-                                                            ) {
-                                                                eprintln!("TTS Error: {}", e);
-                                                            }
-                                                            *is_speaking_clone.lock().unwrap() =
-                                                                false;
-                                                        });
-                                                    }
+                                                    spawn_tts(speak_text.to_string(),
+                                                        TtsSettings::from_config(&config),
+                                                        tts_interrupt.clone(),
+                                                        is_tts_speaking.clone(),
+                                                    );
                                                     format!("🔊 {}", speak_text)
                                                 } else {
                                                     String::new()
@@ -3825,6 +4613,8 @@ fn main() -> Result<()> {
                                                     }
                                                     "code" => VoiceMode::Code { language: None },
                                                     "command" => VoiceMode::Command,
+                                                    "translate" => VoiceMode::Translate,
+                                                    "screen" => VoiceMode::Screen,
                                                     _ => VoiceMode::Dictation,
                                                 };
 
@@ -3838,29 +4628,11 @@ fn main() -> Result<()> {
                                                     .get("confirmation")
                                                     .and_then(|c| c.as_str())
                                                 {
-                                                    if !config.elevenlabs_api_key.is_empty() {
-                                                        let tts = create_elevenlabs_tts(&config);
-                                                        let conf_text = confirmation.to_string();
-                                                        let interrupt_clone = tts_interrupt.clone();
-                                                        let is_speaking_clone =
-                                                            is_tts_speaking.clone();
-                                                        std::thread::spawn(move || {
-                                                            *is_speaking_clone.lock().unwrap() =
-                                                                true;
-                                                            let rt = tokio::runtime::Runtime::new()
-                                                                .unwrap();
-                                                            if let Err(e) = rt.block_on(
-                                                                tts.speak_and_play_interruptible(
-                                                                    &conf_text,
-                                                                    Some(interrupt_clone),
-                                                                ),
-                                                            ) {
-                                                                eprintln!("TTS Error: {}", e);
-                                                            }
-                                                            *is_speaking_clone.lock().unwrap() =
-                                                                false;
-                                                        });
-                                                    }
+                                                    spawn_tts(confirmation.to_string(),
+                                                        TtsSettings::from_config(&config),
+                                                        tts_interrupt.clone(),
+                                                        is_tts_speaking.clone(),
+                                                    );
                                                     format!("🔊 {}", confirmation)
                                                 } else {
                                                     format!("🔊 Switched to {} mode", mode_str)
@@ -3883,41 +4655,11 @@ fn main() -> Result<()> {
                                                             speak_text
                                                         );
                                                     }
-
-                                                    // Speak the response using ElevenLabsTts
-                                                    if !config.elevenlabs_api_key.is_empty() {
-                                                        let tts = create_elevenlabs_tts(&config);
-                                                        let speak_text_owned =
-                                                            speak_text.to_string();
-                                                        let is_tts_speaking_clone =
-                                                            is_tts_speaking.clone();
-                                                        let interrupt_clone = tts_interrupt.clone();
-
-                                                        std::thread::spawn(move || {
-                                                            // Set flag to true before speaking
-                                                            *is_tts_speaking_clone
-                                                                .lock()
-                                                                .unwrap() = true;
-
-                                                            let rt = tokio::runtime::Runtime::new()
-                                                                .unwrap();
-                                                            if let Err(e) = rt.block_on(
-                                                                tts.speak_and_play_interruptible(
-                                                                    &speak_text_owned,
-                                                                    Some(interrupt_clone),
-                                                                ),
-                                                            ) {
-                                                                eprintln!("TTS Error: {}", e);
-                                                            }
-
-                                                            // Set flag back to false after speaking
-                                                            *is_tts_speaking_clone
-                                                                .lock()
-                                                                .unwrap() = false;
-                                                        });
-                                                    } else {
-                                                        eprintln!("TTS request ignored: ELEVENLABS_API_KEY not set");
-                                                    }
+                                                    spawn_tts(speak_text.to_string(),
+                                                        TtsSettings::from_config(&config),
+                                                        tts_interrupt.clone(),
+                                                        is_tts_speaking.clone(),
+                                                    );
                                                 }
                                             }
                                         }
@@ -3966,6 +4708,7 @@ fn main() -> Result<()> {
                                     conversation_id: s.current_conversation_id,
                                 };
                                 s.conversation_history.push_back(entry);
+                                s.partial_transcription = None;
 
                                 // Keep only last 50 entries to prevent memory bloat
                                 while s.conversation_history.len() > 50 {
@@ -4073,22 +4816,22 @@ fn main() -> Result<()> {
                         // Only show troubleshooting in non-TUI mode
                         if tui_state.is_none() {
                             match backend {
-                                Backend::Speaches => {
+                                Backend::OpenAICompat => {
                                     eprintln!(
-                                        "   Backend: Speaches ({})",
-                                        config.speaches_base_url
+                                        "   Backend: OpenAI-compatible ({})",
+                                        config.openai_compat_base_url
                                     );
                                     eprintln!("   Troubleshooting:");
                                     eprintln!(
-                                    "   • Check if Speaches is running: docker ps | grep speaches"
+                                    "   • Check if the OpenAI-compatible server is running: docker ps | grep speaches"
                                 );
                                     eprintln!(
                                         "   • Test connection: curl {}/health",
                                         config
-                                            .speaches_base_url
+                                            .openai_compat_base_url
                                             .trim_end_matches("/v1/audio/transcriptions")
                                     );
-                                    eprintln!("   • View logs: docker logs speaches");
+                                    eprintln!("   • View logs: docker logs openai_compat");
                                 }
                                 Backend::OpenAI => {
                                     eprintln!(

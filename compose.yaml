@@ -1,0 +1,29 @@
+# Local realtime STT (Speaches) for voxtty.
+#
+# Bring up:   podman-compose up -d        (or: docker compose up -d)
+# Logs:       podman-compose logs -f speaches
+# Tear down:  podman-compose down
+#
+# Then run voxtty against it:
+#   OPENAI_COMPAT_BASE_URL=http://localhost:8000 \
+#   TRANSCRIPTION_MODEL_ID=Systran/faster-distil-whisper-small.en \
+#   cargo run --release -- --openai-compat --realtime --assistant
+#
+# Lemonade (Kokoro TTS + batch STT) runs natively on :13305 and is NOT managed
+# here — containerizing it loses NPU/iGPU acceleration on AMD Strix Halo.
+# Pair them by also setting:
+#   TTS_BACKEND=openai TTS_BASE_URL=http://localhost:13305 TTS_MODEL=kokoro-v1
+services:
+  speaches:
+    # AMD Strix Halo has no CUDA; the CPU image is the supported path.
+    image: ghcr.io/speaches-ai/speaches:latest-cpu
+    container_name: speaches
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persist downloaded models across restarts.
+      - speaches-hub:/home/ubuntu/.cache/huggingface/hub
+
+volumes:
+  speaches-hub:

@@ -14,7 +14,7 @@ const MAX_TOOL_ITERATIONS: usize = 5;
 
 /// Assistant backend trait
 ///
-/// Different backends (Speaches, MCP) implement this trait
+/// Different backends (OpenAI-compatible, MCP) implement this trait
 pub trait AssistantBackend: Send + Sync {
     /// Process audio with LLM assistance
     fn process_with_llm(&self, audio_path: &Path, mode: &VoiceMode, debug: bool) -> Result<String>;
@@ -62,7 +62,10 @@ impl AudioProcessor for AssistantProcessor {
     fn supports_mode(&self, mode: &VoiceMode) -> bool {
         matches!(
             mode,
-            VoiceMode::Assistant { .. } | VoiceMode::Code { .. } | VoiceMode::Command
+            VoiceMode::Assistant { .. }
+                | VoiceMode::Code { .. }
+                | VoiceMode::Command
+                | VoiceMode::Translate
         )
     }
 
@@ -72,11 +75,11 @@ impl AudioProcessor for AssistantProcessor {
 }
 
 // ============================================================================
-// Speaches Voice Chat Backend
+// OpenAI-compatible Voice Chat Backend
 // ============================================================================
 
 #[derive(Debug, Clone)]
-pub struct SpeachesAssistantConfig {
+pub struct OpenAICompatAssistantConfig {
     pub base_url: String,
     pub api_key: String,
     pub transcription_url: String,
@@ -87,13 +90,13 @@ pub struct SpeachesAssistantConfig {
     pub code_system_prompt: String,
 }
 
-pub struct SpeachesAssistantBackend {
-    config: SpeachesAssistantConfig,
+pub struct OpenAICompatAssistantBackend {
+    config: OpenAICompatAssistantConfig,
     mcp_manager: Option<Arc<Mutex<McpManager>>>,
 }
 
-impl SpeachesAssistantBackend {
-    pub fn new(config: SpeachesAssistantConfig) -> Self {
+impl OpenAICompatAssistantBackend {
+    pub fn new(config: OpenAICompatAssistantConfig) -> Self {
         Self {
             config,
             mcp_manager: None,
@@ -106,11 +109,20 @@ impl SpeachesAssistantBackend {
     }
 
     fn get_system_prompt(&self, mode: &VoiceMode) -> String {
-        match mode {
+        let base = match mode {
             VoiceMode::Code { .. } => self.config.code_system_prompt.clone(),
             VoiceMode::Command => include_str!("../prompts/command.md").to_string(),
+            VoiceMode::Translate => crate::translate_prompt(),
             _ => self.config.system_prompt.clone(),
+        };
+        // Translate mode is a pure transcribe→translate task: appending user
+        // skills only adds irrelevant noise that pushes small models off-task
+        // (e.g. translating into the wrong language). Keep its prompt clean.
+        if matches!(mode, VoiceMode::Translate) {
+            return base;
         }
+        // Append user skills dropped in ~/.config/voxtty/skills/*.md (hot-reloaded).
+        format!("{}{}", base, crate::skills::skills_prompt_section())
     }
 
     fn transcribe_audio(&self, audio_path: &Path, debug: bool) -> Result<String> {
@@ -209,7 +221,7 @@ struct ChatResponse {
     choices: Vec<Choice>,
 }
 
-impl SpeachesAssistantBackend {
+impl OpenAICompatAssistantBackend {
     /// Build the tools array for the LLM request
     fn build_tools(&self, mode: &VoiceMode) -> (serde_json::Value, bool) {
         let mut tools = serde_json::json!([]);
@@ -297,12 +309,16 @@ impl SpeachesAssistantBackend {
             tools.as_array_mut().unwrap().push(switch_mode_tool);
         }
 
-        // Append MCP tools dynamically from manager (supports background init)
-        if let Some(ref mgr) = self.mcp_manager {
-            let mcp_tools = mgr.lock().unwrap().to_openai_tools();
-            for mcp_tool in mcp_tools {
-                tools.as_array_mut().unwrap().push(mcp_tool);
-                has_tools = true;
+        // Append MCP tools dynamically from manager (supports background init).
+        // Translate mode is a pure translation task and must not be offered
+        // external tools.
+        if !matches!(mode, VoiceMode::Translate) {
+            if let Some(ref mgr) = self.mcp_manager {
+                let mcp_tools = mgr.lock().unwrap().to_openai_tools();
+                for mcp_tool in mcp_tools {
+                    tools.as_array_mut().unwrap().push(mcp_tool);
+                    has_tools = true;
+                }
             }
         }
 
@@ -352,16 +368,22 @@ impl SpeachesAssistantBackend {
     fn call_llm(&self, text: &str, mode: &VoiceMode, debug: bool) -> Result<String> {
         let mut system_prompt = self.get_system_prompt(mode);
 
-        // Inject current date/time so the LLM always knows
-        let now = chrono::Local::now();
-        system_prompt.push_str(&format!(
-            "\n\n## CURRENT CONTEXT\n\n- **Date**: {}\n- **Time**: {}\n",
-            now.format("%A, %B %d, %Y"),
-            now.format("%I:%M %p")
-        ));
+        // Translate mode is a pure translation task: the date/time and MCP tool
+        // catalog are irrelevant noise that destabilizes small models. Skip them.
+        let is_translate = matches!(mode, VoiceMode::Translate);
+
+        if !is_translate {
+            // Inject current date/time so the LLM always knows
+            let now = chrono::Local::now();
+            system_prompt.push_str(&format!(
+                "\n\n## CURRENT CONTEXT\n\n- **Date**: {}\n- **Time**: {}\n",
+                now.format("%A, %B %d, %Y"),
+                now.format("%I:%M %p")
+            ));
+        }
 
         // Append MCP tool descriptions dynamically from manager
-        if let Some(ref mgr) = self.mcp_manager {
+        if let (false, Some(ref mgr)) = (is_translate, &self.mcp_manager) {
             let mcp_tools = mgr.lock().unwrap().to_openai_tools();
             if !mcp_tools.is_empty() {
                 system_prompt.push_str("\n\n## EXTERNAL TOOLS (MCP)\n\n");
@@ -398,6 +420,13 @@ impl SpeachesAssistantBackend {
 
         let (tools, has_tools) = self.build_tools(mode);
 
+        // Translate mode: ask the server to render the chat template with
+        // thinking disabled (Qwen3-style reasoning models otherwise burn
+        // latency on chain-of-thought before the translation). llama.cpp
+        // servers honor this when started with `--jinja`; servers that reject
+        // the unknown field get one retry without it below.
+        let mut template_kwargs = matches!(mode, VoiceMode::Translate);
+
         for iteration in 0..=MAX_TOOL_ITERATIONS {
             let mut body = serde_json::json!({
                 "model": self.config.llm_model,
@@ -417,7 +446,32 @@ impl SpeachesAssistantBackend {
                 }
             }
 
-            let result = self.send_chat_request(&body, debug)?;
+            if template_kwargs {
+                if let Some(obj) = body.as_object_mut() {
+                    obj.insert(
+                        "chat_template_kwargs".to_string(),
+                        serde_json::json!({"enable_thinking": false}),
+                    );
+                }
+            }
+
+            let result = match self.send_chat_request(&body, debug) {
+                Ok(r) => r,
+                Err(e) if template_kwargs => {
+                    if debug {
+                        println!(
+                            "[DEBUG] Request with chat_template_kwargs failed ({}); retrying without it",
+                            e
+                        );
+                    }
+                    template_kwargs = false;
+                    body.as_object_mut()
+                        .unwrap()
+                        .remove("chat_template_kwargs");
+                    self.send_chat_request(&body, debug)?
+                }
+                Err(e) => return Err(e),
+            };
             let message = &result.choices[0].message;
 
             // Check for tool calls
@@ -455,7 +509,7 @@ impl SpeachesAssistantBackend {
                                     MAX_TOOL_ITERATIONS
                                 );
                             }
-                            return Ok(message.content.clone().unwrap_or_default());
+                            return Ok(crate::processors_conversation::strip_think_blocks(&message.content.clone().unwrap_or_default()));
                         }
 
                         let tool_result = match mcp_mgr
@@ -509,18 +563,18 @@ impl SpeachesAssistantBackend {
             }
 
             // No tool call — return content
-            return Ok(message.content.clone().unwrap_or_default());
+            return Ok(crate::processors_conversation::strip_think_blocks(&message.content.clone().unwrap_or_default()));
         }
 
         anyhow::bail!("Exceeded maximum tool call iterations")
     }
 }
 
-impl AssistantBackend for SpeachesAssistantBackend {
+impl AssistantBackend for OpenAICompatAssistantBackend {
     fn process_with_llm(&self, audio_path: &Path, mode: &VoiceMode, debug: bool) -> Result<String> {
         if debug {
             println!(
-                "[DEBUG] SpeachesAssistantBackend: Processing with mode {:?}",
+                "[DEBUG] OpenAICompatAssistantBackend: Processing with mode {:?}",
                 mode
             );
         }
@@ -539,7 +593,7 @@ impl AssistantBackend for SpeachesAssistantBackend {
     fn process_text_with_llm(&self, text: &str, mode: &VoiceMode, debug: bool) -> Result<String> {
         if debug {
             println!(
-                "[DEBUG] SpeachesAssistantBackend: Processing text with mode {:?}",
+                "[DEBUG] OpenAICompatAssistantBackend: Processing text with mode {:?}",
                 mode
             );
         }

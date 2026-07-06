@@ -8,7 +8,7 @@ use std::path::Path;
 #[derive(Debug, Clone, PartialEq)]
 pub enum TranscriptionBackend {
     WhisperCpp,
-    Speaches,
+    OpenAICompat,
     OpenAI,
 }
 
@@ -16,16 +16,19 @@ pub enum TranscriptionBackend {
 #[derive(Debug, Clone)]
 pub struct TranscriptionConfig {
     pub backend: TranscriptionBackend,
-    pub speaches_url: String,
-    pub speaches_model: String,
+    pub openai_compat_url: String,
+    pub openai_compat_model: String,
     pub whisper_url: String,
     pub openai_url: String,
     pub openai_api_key: String,
+    /// Model name sent to the OpenAI-compatible transcription endpoint.
+    /// "whisper-1" for OpenAI cloud; overridable for local servers (e.g. "Whisper-Base").
+    pub openai_model: String,
 }
 
 /// Direct transcription processor
 ///
-/// This is the current VoiceTypr behavior - just transcribe audio to text
+/// This is the current voxtty behavior - just transcribe audio to text
 pub struct TranscriptionProcessor {
     config: TranscriptionConfig,
 }
@@ -35,12 +38,12 @@ impl TranscriptionProcessor {
         Self { config }
     }
 
-    fn transcribe_speaches(&self, audio_path: &Path) -> Result<String> {
+    fn transcribe_openai_compat(&self, audio_path: &Path) -> Result<String> {
         let client = reqwest::blocking::Client::new();
         let file = std::fs::read(audio_path)?;
 
         let form = reqwest::blocking::multipart::Form::new()
-            .text("model", self.config.speaches_model.clone())
+            .text("model", self.config.openai_compat_model.clone())
             .part(
                 "file",
                 reqwest::blocking::multipart::Part::bytes(file).file_name(
@@ -58,7 +61,7 @@ impl TranscriptionProcessor {
         }
 
         let response = client
-            .post(&self.config.speaches_url)
+            .post(&self.config.openai_compat_url)
             .multipart(form)
             .send()?
             .json::<Response>()?;
@@ -72,7 +75,9 @@ impl TranscriptionProcessor {
 
         let form = reqwest::blocking::multipart::Form::new()
             .text("temperature", "0.2")
-            .text("response-format", "text")
+            // OpenAI-style underscore param; the hyphenated form is ignored by
+            // whisper.cpp (returns JSON instead of plain text).
+            .text("response_format", "text")
             .part(
                 "file",
                 reqwest::blocking::multipart::Part::bytes(file).file_name(
@@ -90,7 +95,13 @@ impl TranscriptionProcessor {
             .send()?
             .text()?;
 
-        Ok(response.trim().to_string())
+        // Accept either plain text or a JSON {"text": ...} envelope.
+        let body = response.trim();
+        let text = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(str::to_string))
+            .unwrap_or_else(|| body.to_string());
+        Ok(text.trim().to_string())
     }
 
     fn transcribe_openai(&self, audio_path: &Path) -> Result<String> {
@@ -98,7 +109,7 @@ impl TranscriptionProcessor {
         let file = std::fs::read(audio_path)?;
 
         let form = reqwest::blocking::multipart::Form::new()
-            .text("model", "whisper-1")
+            .text("model", self.config.openai_model.clone())
             .part(
                 "file",
                 reqwest::blocking::multipart::Part::bytes(file)
@@ -117,14 +128,17 @@ impl TranscriptionProcessor {
             text: String,
         }
 
-        let response = client
-            .post(&self.config.openai_url)
-            .header(
+        let mut request = client.post(&self.config.openai_url).multipart(form);
+
+        // Local OpenAI-compatible servers (e.g. Lemonade) usually need no auth.
+        if !self.config.openai_api_key.is_empty() {
+            request = request.header(
                 "Authorization",
                 format!("Bearer {}", self.config.openai_api_key),
-            )
-            .multipart(form)
-            .send()?;
+            );
+        }
+
+        let response = request.send()?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -149,7 +163,7 @@ impl AudioProcessor for TranscriptionProcessor {
         }
 
         match self.config.backend {
-            TranscriptionBackend::Speaches => self.transcribe_speaches(audio_path),
+            TranscriptionBackend::OpenAICompat => self.transcribe_openai_compat(audio_path),
             TranscriptionBackend::WhisperCpp => self.transcribe_whisper_cpp(audio_path),
             TranscriptionBackend::OpenAI => self.transcribe_openai(audio_path),
         }

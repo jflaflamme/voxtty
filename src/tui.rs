@@ -247,6 +247,13 @@ impl TuiApp {
                     state.last_transcription.clear();
                 }
             }
+            KeyCode::Char('5') => {
+                if let Ok(mut state) = self.state.lock() {
+                    state.mode = VoiceMode::Translate;
+                    state.last_input.clear();
+                    state.last_transcription.clear();
+                }
+            }
             KeyCode::Char('p') | KeyCode::Char(' ') => {
                 if let Ok(mut state) = self.state.lock() {
                     state.is_paused = !state.is_paused;
@@ -681,8 +688,9 @@ impl TuiApp {
 
         // Audio Sparkline
         let audio_data: Vec<u64> = state.audio_history.iter().copied().collect();
-        // Dynamic max value for better visualization scaling
-        let max_value = 100;
+        // Auto-scale to the loudest sample in the window (with a floor so idle
+        // noise doesn't fill the bars) — works regardless of the mic's gain.
+        let max_value = audio_data.iter().copied().max().unwrap_or(1).max(40);
 
         let sparkline =
             Sparkline::default()
@@ -1042,6 +1050,10 @@ impl TuiApp {
                 Span::styled("  4            ", Style::default().fg(Color::Yellow)),
                 Span::raw("Command mode - execute shell commands"),
             ]),
+            Line::from(vec![
+                Span::styled("  5            ", Style::default().fg(Color::Cyan)),
+                Span::raw("Translate mode - speak the translation aloud"),
+            ]),
             Line::from(""),
             Line::from(Span::styled(
                 "Controls:",
@@ -1069,7 +1081,7 @@ impl TuiApp {
             ]),
             Line::from(vec![
                 Span::styled("  b            ", Style::default().fg(Color::Cyan)),
-                Span::raw("Switch backend (OpenAI ↔ Speaches)"),
+                Span::raw("Switch backend (OpenAI ↔ OpenAI-compatible)"),
             ]),
             Line::from(""),
             Line::from(Span::styled(
@@ -1102,6 +1114,8 @@ fn mode_name(mode: &VoiceMode) -> &str {
         VoiceMode::Assistant { .. } => "Assistant",
         VoiceMode::Code { .. } => "Code",
         VoiceMode::Command => "Command",
+        VoiceMode::Translate => "Translate",
+        VoiceMode::Screen => "Screen",
     }
 }
 
@@ -1111,6 +1125,8 @@ fn mode_color(mode: &VoiceMode) -> Style {
         VoiceMode::Assistant { .. } => Style::default().fg(Color::Rgb(33, 150, 243)), // Blue
         VoiceMode::Code { .. } => Style::default().fg(Color::Rgb(156, 39, 176)), // Purple/Magenta
         VoiceMode::Command => Style::default().fg(Color::Rgb(255, 193, 7)),   // Amber/Gold
+        VoiceMode::Translate => Style::default().fg(Color::Rgb(0, 188, 212)), // Cyan/Teal
+        VoiceMode::Screen => Style::default().fg(Color::Rgb(255, 112, 67)),   // Deep orange
     }
 }
 
@@ -1134,8 +1150,15 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-/// Helper function to restore the terminal to its original state
-fn cleanup_terminal() -> Result<()> {
+/// Restore the terminal to its original state. Idempotent: runs at most once,
+/// so the TUI thread's guard and main's pre-exit call can't double-restore
+/// (a second LeaveAlternateScreen would print escape codes onto the shell).
+pub fn cleanup_terminal() -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
     disable_raw_mode()?;
     execute!(
         io::stdout(),

@@ -1,6 +1,6 @@
-# VoiceTypr System Prompts
+# voxtty System Prompts
 
-This directory contains the system prompts used for different voice modes in VoiceTypr. These prompts are compiled into the binary using Rust's `include_str!` macro, so any changes require a rebuild.
+This directory contains the system prompts used for different voice modes in voxtty. These prompts are compiled into the binary using Rust's `include_str!` macro, so any changes require a rebuild.
 
 ## Available Prompts
 

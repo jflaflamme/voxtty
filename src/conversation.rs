@@ -80,10 +80,17 @@ impl ConversationContext {
         });
     }
 
-    /// Get the conversation history formatted for LLM context
+    /// Maximum turns replayed to the LLM each request. Older turns are dropped:
+    /// unbounded history bloats the prompt (slower prefill on local models) and
+    /// stale context degrades small-model behavior.
+    const MAX_LLM_HISTORY_TURNS: usize = 8;
+
+    /// Get the conversation history formatted for LLM context (recent turns only)
     pub fn get_context_for_llm(&self) -> Vec<String> {
+        let skip = self.history.len().saturating_sub(Self::MAX_LLM_HISTORY_TURNS);
         self.history
             .iter()
+            .skip(skip)
             .map(|turn| {
                 let prefix = match turn.speaker {
                     Speaker::User => "User:",

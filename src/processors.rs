@@ -21,6 +21,11 @@ pub enum VoiceMode {
     Code { language: Option<String> },
     /// Command mode - execute shell commands
     Command,
+    /// Translation - speak the user's words back in a target language
+    Translate,
+    /// Screen awareness - capture the focused window (terminal text or a
+    /// screenshot) and answer questions about what's on screen.
+    Screen,
 }
 
 /// Trait for audio processors

@@ -150,5 +150,19 @@ pub fn print_mode_change(mode: &VoiceMode, base_url: &str) {
         VoiceMode::Command => {
             println!("\n⌨️  Mode: Command (Shell)\n");
         }
+        VoiceMode::Translate => {
+            println!("\n🌐 Mode: Translate");
+            if is_cloud {
+                println!("⚠️  Using cloud AI: {}", base_url);
+            }
+            println!();
+        }
+        VoiceMode::Screen => {
+            println!("\n👁️  Mode: Screen");
+            if is_cloud {
+                println!("⚠️  Using cloud AI: {}", base_url);
+            }
+            println!();
+        }
     }
 }

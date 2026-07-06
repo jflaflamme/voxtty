@@ -40,7 +40,7 @@ docker run -d --name speaches -p 8000:8000 \
 voxtty --echo-test
 
 # 4. Start voice typing
-voxtty --speaches --tray
+voxtty --openai-compat --tray
 ```
 
 **That's it!** Click the tray icon to toggle voice typing on/off.
@@ -84,7 +84,7 @@ voxtty was inspired by [themanyone/voice_typing](https://github.com/themanyone/v
 
 ### Backend Comparison
 
-| Feature | whisper.cpp | Speaches | Realtime (WebSocket) |
+| Feature | whisper.cpp | OpenAI-compatible | Realtime (WebSocket) |
 |---------|-------------|----------|----------------------|
 | **Setup** | Manual build | Docker one-liner | API key or self-hosted |
 | **Latency** | ~3-4s | ~2s | **~150ms** |
@@ -437,16 +437,16 @@ docker-compose up -d
 # After starting Speaches for the first time, you must configure it:
 
 # 1. Set the base URL for Speaches API
-export SPEACHES_BASE_URL="http://localhost:8000"
+export OPENAI_COMPAT_BASE_URL="http://localhost:8000"
 
 # 2. Check available models in the registry
-curl "$SPEACHES_BASE_URL/v1/registry"
+curl "$OPENAI_COMPAT_BASE_URL/v1/registry"
 
 # 3. Download and activate your chosen model (first-time setup)
-curl "$SPEACHES_BASE_URL/v1/models/Systran/faster-distil-whisper-small.en" -X POST
+curl "$OPENAI_COMPAT_BASE_URL/v1/models/Systran/faster-distil-whisper-small.en" -X POST
 
 # 4. Configure voxtty to use Speaches
-export SPEACHES_BASE_URL="http://localhost:8000/v1/audio/transcriptions"
+export OPENAI_COMPAT_BASE_URL="http://localhost:8000/v1/audio/transcriptions"
 export TRANSCRIPTION_MODEL_ID="Systran/faster-distil-whisper-small.en"
 
 # 5. Test the connection (requires a test audio file)
@@ -517,7 +517,7 @@ voxtty
 voxtty --tray
 
 # Use Speaches API backend
-voxtty --speaches
+voxtty --openai-compat
 
 # Enable debug output
 voxtty --debug
@@ -533,7 +533,7 @@ voxtty --select-device --debug
 voxtty --select-device --echo-test
 
 # Speaches API with tray control
-voxtty --speaches --tray
+voxtty --openai-compat --tray
 ```
 
 ### Realtime Streaming Mode
@@ -542,7 +542,7 @@ For the lowest latency (~150ms), use realtime WebSocket streaming:
 
 ```bash
 # Realtime with Speaches (self-hosted, free)
-voxtty --realtime --speaches --tray
+voxtty --realtime --openai-compat --tray
 
 # Realtime with ElevenLabs (cloud, requires API key)
 export ELEVENLABS_API_KEY=your_key_here
@@ -553,7 +553,7 @@ export OPENAI_API_KEY=your_key_here
 voxtty --realtime --openai --tray
 
 # Realtime with voice commands (pause/resume/mode switching)
-voxtty --realtime --speaches --auto --tray
+voxtty --realtime --openai-compat --auto --tray
 ```
 
 **Realtime Features:**
@@ -569,7 +569,7 @@ voxtty --realtime --speaches --auto --tray
 | `--echo-test` | **Run audio echo test** - Speak and hear playback to verify microphone |
 | `--select-device` | Interactively choose audio input device |
 | `--debug` | Enable detailed debug logging (shows VAD triggers, audio levels) |
-| `--speaches` | **Use Speaches backend** instead of whisper.cpp (default) |
+| `--openai-compat` | **Use an OpenAI-compatible backend** (e.g. Speaches, Lemonade) instead of whisper.cpp |
 | `--tray` | Enable system tray icon with click-to-toggle control |
 | `--tui` | **Enable Terminal UI (TUI) mode** - Full-screen terminal interface |
 | `--realtime` | **Enable realtime WebSocket streaming** (~150ms latency) |
@@ -593,14 +593,14 @@ Launch voxtty with a consolidated single-screen dashboard:
 voxtty --tui
 
 # TUI with specific backend
-voxtty --tui --speaches
+voxtty --tui --openai-compat
 voxtty --tui --realtime --elevenlabs
 ```
 
 **Single Dashboard View:**
 ```
 ┌─────────────────────────────────────────────────┐
-│ voxtty | Dictation | Speaches | LISTENING       │  ← Status bar
+│ voxtty | Dictation | OpenAI-compatible | LISTENING       │  ← Status bar
 ├──────────────────┬──────────────────────────────┤
 │ Live Audio       │ Configuration                │
 │ ████████         │ Model: GPT-4o-mini           │
@@ -700,7 +700,7 @@ whisper_url = "http://127.0.0.1:7777/inference"
 
 ```bash
 export YDOTOOL_SOCKET=/run/user/$(id -u)/.ydotool_socket
-export SPEACHES_BASE_URL=http://localhost:8000/v1/audio/transcriptions
+export OPENAI_COMPAT_BASE_URL=http://localhost:8000/v1/audio/transcriptions
 export TRANSCRIPTION_MODEL_ID=Systran/faster-distil-whisper-small.en
 ```
 
@@ -709,7 +709,7 @@ export TRANSCRIPTION_MODEL_ID=Systran/faster-distil-whisper-small.en
 | Backend | CLI Flag | Default URL | Configuration |
 |---------|----------|-------------|---------------|
 | whisper.cpp | (default) | `http://127.0.0.1:7777/inference` | Config file or env var |
-| Speaches | `--speaches` | `http://localhost:8000/v1/audio/transcriptions` | Config file or env var |
+| OpenAI-compatible | `--openai-compat` | `http://localhost:8000/v1/audio/transcriptions` | Config file or env var |
 
 ### Privacy Summary by Component
 
@@ -718,8 +718,8 @@ Quick reference for privacy-conscious users:
 | Component | Backend | Privacy | Internet Required | CLI Flag |
 |-----------|---------|---------|-------------------|----------|
 | **Transcription** | whisper.cpp | 🔒 100% Local | No | (default) |
-| | Speaches | 🔒 100% Local | No | `--speaches` |
-| | Speaches Realtime | 🔒 100% Local | No | `--realtime --speaches` |
+| | OpenAI-compatible | 🔒 100% Local | No | `--openai-compat` |
+| | OpenAI-compatible Realtime | 🔒 100% Local | No | `--realtime --openai-compat` |
 | | OpenAI Realtime | ☁️ Cloud | Yes | `--realtime --openai` |
 | | ElevenLabs | ☁️ Cloud | Yes | `--realtime --elevenlabs` |
 | **LLM (Assistant/Code)** | Ollama | 🔒 100% Local | No | `--llm ollama` |
@@ -731,10 +731,10 @@ Quick reference for privacy-conscious users:
 **Privacy Tip**: For complete privacy, use:
 ```bash
 # 100% offline voice typing
-voxtty --speaches --tray
+voxtty --openai-compat --tray
 
 # 100% offline with AI assistance
-voxtty --speaches --assistant --llm ollama --tray
+voxtty --openai-compat --assistant --llm ollama --tray
 ```
 
 ### ⚠️ Important: ydotool Setup
@@ -899,7 +899,7 @@ ydotool type "test"
 **Need more help?**
 ```bash
 # Run with debug output
-voxtty --debug --speaches
+voxtty --debug --openai-compat
 ```
 
 ## 🤝 Contributing
