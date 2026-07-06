@@ -3103,8 +3103,10 @@ fn main() -> Result<()> {
                     if let Ok(mut s) = state.lock() {
                         s.audio_level = avg_level;
 
-                        // Update audio history for Sparkline (scale to 0-100)
-                        let level_scaled = (avg_level * 100.0) as u64;
+                        // Update audio history for Sparkline. Mic levels are tiny
+                        // floats (quiet USB mics ~0.01 even on speech), so scale up
+                        // generously; the sparkline auto-scales its max to the window.
+                        let level_scaled = (avg_level * 2000.0) as u64;
                         s.audio_history.push_back(level_scaled);
 
                         // Keep only last 100 samples
@@ -3735,6 +3737,8 @@ fn main() -> Result<()> {
                                         s.current_conversation_id += 1;
                                     }
                                     s.last_input = text.clone();
+                                    // Show what was heard right away, before the LLM replies.
+                                    s.partial_transcription = Some(text.clone());
                                 }
                             }
 
@@ -3908,6 +3912,8 @@ fn main() -> Result<()> {
                                         conversation_id: s.current_conversation_id,
                                     };
                                     s.conversation_history.push_back(entry);
+                                    // Words are now part of the committed exchange.
+                                    s.partial_transcription = None;
 
                                     // Keep only last 50 entries to prevent memory bloat
                                     while s.conversation_history.len() > 50 {
@@ -4702,6 +4708,7 @@ fn main() -> Result<()> {
                                     conversation_id: s.current_conversation_id,
                                 };
                                 s.conversation_history.push_back(entry);
+                                s.partial_transcription = None;
 
                                 // Keep only last 50 entries to prevent memory bloat
                                 while s.conversation_history.len() > 50 {

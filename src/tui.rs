@@ -688,8 +688,9 @@ impl TuiApp {
 
         // Audio Sparkline
         let audio_data: Vec<u64> = state.audio_history.iter().copied().collect();
-        // Dynamic max value for better visualization scaling
-        let max_value = 100;
+        // Auto-scale to the loudest sample in the window (with a floor so idle
+        // noise doesn't fill the bars) — works regardless of the mic's gain.
+        let max_value = audio_data.iter().copied().max().unwrap_or(1).max(40);
 
         let sparkline =
             Sparkline::default()
